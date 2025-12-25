@@ -1,0 +1,11 @@
+# LangGraph and LangChain dependencies
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+
+# LangGraph and LangChain dependencies
+langgraph
+langchain
+langchain-core
+langchain-google-genai
