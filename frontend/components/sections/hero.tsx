@@ -2,6 +2,7 @@
 
 import { Shield, Github, FileText, ArrowRight } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { ModeToggle } from "@/components/mode-toggle"
 
 export function HeroSection() {
   return (
@@ -30,9 +31,12 @@ export function HeroSection() {
               </a>
             </div>
 
-            <Button size="sm" className="h-9">
-              Get Started
-            </Button>
+            <div className="flex items-center gap-3">
+              <ModeToggle />
+              <Button size="sm" className="h-9">
+                Get Started
+              </Button>
+            </div>
           </div>
         </div>
       </nav>
