@@ -1,21 +1,14 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
-import { Shield, Lock, Unlock, Download, Eraser, Send,  Loader2, Scan, Database, User, Terminal as TerminalIcon, ChevronDown, ChevronUp } from "lucide-react"
+import { Shield, Lock, Unlock, Download, Eraser, Send,  Loader2, Scan, Database, User, Terminal as TerminalIcon, ChevronDown, ChevronUp, CheckCircle2 } from "lucide-react"
 import { motion, AnimatePresence } from "framer-motion"
+import { useCanvas } from "@/hooks/use-canvas"
+import { useFHE, LogEntry } from "@/hooks/use-fhe"
 
-// --- Types ---
-interface LogEntry {
-  id: string
-  timestamp: string
-  message: string
-  type: "info" | "success" | "warning" | "error"
-}
+// --- Sub-Components ---
 
-// --- Components ---
-
-// 1. Terminal Component
 function LiveTerminal({ logs }: { logs: LogEntry[] }) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -46,7 +39,7 @@ function LiveTerminal({ logs }: { logs: LogEntry[] }) {
             <div className="text-slate-600 italic">Waiting for input...</div>
         )}
         {logs.map((log) => (
-          <div key={log.id} className="flex gap-2">
+          <div key={log.id} className="flex gap-2 animate-in fade-in slide-in-from-left-1 duration-300">
             <span className="text-slate-500 shrink-0">[{log.timestamp}]</span>
             <span className={
                 log.type === "error" ? "text-red-400" :
@@ -64,7 +57,6 @@ function LiveTerminal({ logs }: { logs: LogEntry[] }) {
   )
 }
 
-// 2. Step Badge
 function StepBadge({ type }: { type: "client" | "server" }) {
     return (
         <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
@@ -78,7 +70,6 @@ function StepBadge({ type }: { type: "client" | "server" }) {
     )
 }
 
-// 3. Step Container
 function StepItem({ 
     stepNumber, 
     title, 
@@ -106,7 +97,8 @@ function StepItem({
         }`}>
             <button 
                 onClick={onToggle}
-                className="w-full flex items-center justify-between p-4 focus:outline-none"
+                className="w-full flex items-center justify-between p-4 focus:outline-none hover:bg-muted/50 transition-colors"
+                disabled={!isActive && !isCompleted}
             >
                 <div className="flex items-center gap-4">
                     <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm transition-colors ${
@@ -147,220 +139,55 @@ function StepItem({
     )
 }
 
-import { CheckCircle2 } from "lucide-react"
+// --- Main Component ---
 
-// --- Main Page Component ---
 export function DigitRecog() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [logs, setLogs] = useState<LogEntry[]>([])
   const [activeStep, setActiveStep] = useState<1 | 2 | 3>(1)
   const [completedSteps, setCompletedSteps] = useState<number[]>([])
 
-  // State
-  const [isDrawing, setIsDrawing] = useState(false)
-  const [isProcessing, setIsProcessing] = useState(false)
-  const [pixels, setPixels] = useState<number[]>([])
-  const [noiseImage, setNoiseImage] = useState<string | null>(null)
-  const [prediction, setPrediction] = useState<number | null>(null)
+  // Hooks
+  const { canvasRef, initCanvas, startDrawing, draw, stopDrawing, getPixelData } = useCanvas()
+  const { logs, addLog, isProcessing, prediction, noiseImage, encryptInput, sendToServer, decryptResult, resetState } = useFHE()
 
-  // Initialize Canvas
+  // Initialize
   useEffect(() => {
-    initCanvas()
     addLog("System initialized. Waiting for user input...", "info")
-  }, [])
+  }, [addLog])
 
-  const addLog = (message: string, type: LogEntry["type"] = "info") => {
-    const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
-    const id = Math.random().toString(36).substring(7)
-    setLogs(prev => [...prev, { id, timestamp, message, type }])
-  }
-
-  const initCanvas = () => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return
-    ctx.fillStyle = "white"
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-  }
-
-  // --- Step 1 Actions ---
-  const handleEncryptInput = async () => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    
-    // Check if empty
-    const pixels = preprocessImage(canvas)
+  // Handlers
+  const onEncrypt = async () => {
+    const pixels = getPixelData()
     if (pixels.length === 0) {
         addLog("Canvas is empty. Please draw a digit first.", "warning")
         return
     }
-
-    setIsProcessing(true)
-    addLog("Starting encryption process...", "info")
-    
-    // Tiny delay for UX
-    await new Promise(r => setTimeout(r, 500))
-    
-    addLog("Generating CKKS context parameters...", "info")
-    addLog("Poly Modulus Degree: 8192", "info")
-    addLog("Coeff Modulus Sizes: [60, 40, 40, 60]", "info")
-    
-    await new Promise(r => setTimeout(r, 800))
-    setPixels(pixels)
-    
-    // Generate Visual Noise
-    const noise = generateNoiseImage()
-    setNoiseImage(noise)
-    
-    addLog("Input vector successfully encrypted.", "success")
-    addLog("Ciphertext generated.", "info")
-    
-    setIsProcessing(false)
-    setCompletedSteps(prev => [...prev, 1])
-    setActiveStep(2)
+    const success = await encryptInput(pixels)
+    if (success) {
+        setCompletedSteps(prev => [...prev, 1])
+        setActiveStep(2)
+    }
   }
 
-  // --- Step 2 Actions ---
-  const handleSendToServer = async () => {
-    setIsProcessing(true)
-    addLog("Initiating secure connection to server...", "info")
-    addLog("Uploading encrypted payload (Ciphertext)...", "info")
-    
-    try {
-        const res = await fetch("http://localhost:8000/classify", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ image: pixels })
-        })
-        
-        addLog("Server received payload.", "info")
-        addLog("Server computing Homomorphic Dot Product...", "info")
-        addLog("Server computing Square Activation...", "info")
-        
-        await new Promise(r => setTimeout(r, 1000)) // Fake computation time delay
-        
-        if (!res.ok) throw new Error("Server Error")
-        const data = await res.json()
-        
-        setPrediction(data.prediction)
-        
-        addLog("Computation complete. Result encrypted.", "info")
-        addLog("Downloading encrypted result...", "success")
-        
-        setIsProcessing(false)
+  const onSend = async () => {
+    const success = await sendToServer()
+    if (success) {
         setCompletedSteps(prev => [...prev, 2])
         setActiveStep(3)
-        
-    } catch (e) {
-        addLog("Failed to communicate with server.", "error")
-        setIsProcessing(false)
     }
   }
 
-  // --- Step 3 Actions ---
-  const handleDecrypt = async () => {
-    setIsProcessing(true)
-    addLog("Requesting private key for decryption...", "info")
-    await new Promise(r => setTimeout(r, 600))
-    
-    addLog("Decrypting result vector...", "info")
-    addLog(`Decryption successful.`, "success")
-    addLog(`Model Classification: ${prediction}`, "success")
-    
-    setIsProcessing(false)
-    setCompletedSteps(prev => [...prev, 3])
+  const onDecrypt = async () => {
+    const success = await decryptResult()
+    if (success) {
+        setCompletedSteps(prev => [...prev, 3])
+    }
   }
 
-  const handleReset = () => {
+  const onReset = () => {
+    resetState()
     initCanvas()
-    setPixels([])
-    setNoiseImage(null)
-    setPrediction(null)
     setCompletedSteps([])
     setActiveStep(1)
-    setLogs([])
-    addLog("Session reset. Ready for new input.", "info")
-  }
-
-  // --- Helpers ---
-  const generateNoiseImage = () => {
-    const cvs = document.createElement("canvas")
-    cvs.width = 200; cvs.height = 200
-    const ctx = cvs.getContext("2d")
-    if(!ctx) return null
-    const idata = ctx.createImageData(200, 200)
-    for(let i=0; i<idata.data.length; i+=4) {
-        const v = Math.random() * 255
-        idata.data[i] = v
-        idata.data[i+1] = v
-        idata.data[i+2] = v
-        idata.data[i+3] = 255
-    }
-    ctx.putImageData(idata, 0, 0)
-    return cvs.toDataURL()
-  }
-
-  // Reuse existing canvas helpers
-  const getCoordinates = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current
-    if (!canvas) return { x: 0, y: 0 }
-    const rect = canvas.getBoundingClientRect()
-    const scaleX = canvas.width / rect.width
-    const scaleY = canvas.height / rect.height
-    return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY }
-  }
-  const startDrawing = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    setIsDrawing(true); const {x,y} = getCoordinates(e); 
-    const ctx = canvasRef.current?.getContext("2d"); if(!ctx) return;
-    ctx.beginPath(); ctx.moveTo(x,y); ctx.lineWidth=15; ctx.lineCap="round"; ctx.strokeStyle="black"
-  }
-  const draw = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if(!isDrawing) return; const {x,y} = getCoordinates(e);
-    const ctx = canvasRef.current?.getContext("2d"); if(!ctx) return;
-    ctx.lineTo(x,y); ctx.stroke()
-  }
-  const stopDrawing = () => { setIsDrawing(false); canvasRef.current?.getContext("2d")?.beginPath() }
-  
-  const preprocessImage = (canvas: HTMLCanvasElement): number[] => {
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return []
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-    let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0
-    for (let y = 0; y < canvas.height; y++) {
-        for (let x = 0; x < canvas.width; x++) {
-            const i = (y * canvas.width + x) * 4
-            const brightness = (imageData.data[i] + imageData.data[i+1] + imageData.data[i+2]) / 3
-            if (brightness < 250) {
-                minX = Math.min(minX, x); minY = Math.min(minY, y)
-                maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
-            }
-        }
-    }
-    if (minX > maxX) return [] 
-    const padding = 20
-    minX = Math.max(0, minX - padding); minY = Math.max(0, minY - padding)
-    maxX = Math.min(canvas.width, maxX + padding); maxY = Math.min(canvas.height, maxY + padding)
-    const w = maxX - minX, h = maxY - minY
-    const size = Math.max(w, h)
-    const cropCanvas = document.createElement("canvas")
-    cropCanvas.width = size; cropCanvas.height = size
-    const cropCtx = cropCanvas.getContext("2d")
-    if (!cropCtx) return []
-    cropCtx.fillStyle = "white"; cropCtx.fillRect(0, 0, size, size)
-    cropCtx.drawImage(canvas, minX, minY, w, h, (size-w)/2, (size-h)/2, w, h)
-    const tempCanvas = document.createElement("canvas")
-    tempCanvas.width = 28; tempCanvas.height = 28
-    const tempCtx = tempCanvas.getContext("2d")
-    if(!tempCtx) return []
-    tempCtx.imageSmoothingEnabled = true; tempCtx.imageSmoothingQuality = "high"
-    tempCtx.drawImage(cropCanvas, 0, 0, 28, 28)
-    const finalData = tempCtx.getImageData(0, 0, 28, 28)
-    const pixels: number[] = []
-    for(let i=0; i<finalData.data.length; i+=4) {
-        pixels.push((255 - finalData.data[i])/255.0)
-    }
-    return pixels
   }
 
   return (
@@ -403,7 +230,7 @@ export function DigitRecog() {
                         </div>
                         <div className="w-full max-w-xs">
                              <Button 
-                                onClick={handleEncryptInput} 
+                                onClick={onEncrypt} 
                                 disabled={isProcessing}
                                 className="w-full h-12 text-base bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg shadow-indigo-500/20"
                             >
@@ -441,7 +268,7 @@ export function DigitRecog() {
                         </p>
                          <div className="w-full max-w-xs">
                              <Button 
-                                onClick={handleSendToServer} 
+                                onClick={onSend} 
                                 disabled={isProcessing}
                                 className="w-full h-12 text-base bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg shadow-indigo-500/20"
                             >
@@ -490,7 +317,7 @@ export function DigitRecog() {
                          <div className="w-full max-w-xs space-y-3">
                              {!completedSteps.includes(3) && (
                                 <Button 
-                                    onClick={handleDecrypt} 
+                                    onClick={onDecrypt} 
                                     disabled={isProcessing}
                                     className="w-full h-12 text-base bg-green-600 hover:bg-green-700 text-white shadow-lg shadow-green-500/20"
                                 >
@@ -505,7 +332,7 @@ export function DigitRecog() {
                              {completedSteps.includes(3) && (
                                  <Button 
                                     variant="outline"
-                                    onClick={handleReset} 
+                                    onClick={onReset} 
                                     className="w-full"
                                 >
                                     Start Over
