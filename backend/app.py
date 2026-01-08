@@ -1,12 +1,17 @@
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
 import tenseal as ts
 import numpy as np
-import base64
 from model import ConvNet
-import os
+from routers import chat
 
 app = FastAPI(title="FHE Digit Recognition API (TenSEAL)")
 
@@ -18,6 +23,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include Chat Router
+app.include_router(chat.router)
 
 # Global variables
 model = None
@@ -97,10 +105,6 @@ async def classify_digit(payload: ImageInput):
         fc2_bias = model.fc2.bias.data.numpy()
 
         # Layer 1: Linear
-        # enc_hidden = enc_input.mm(fc1_weight) + fc1_bias # TenSEAL .mm() is for matrices, .dot() is for vectors?
-        # For vector inputs and matrix weights: vector * matrix = vector (1x784 * 784x64 = 1x64)
-        # TenSEAL CKKS Vector supports matrix multiplication via .mm or .matmul if one is plain matrix
-        
         enc_hidden = enc_input.matmul(fc1_weight) + fc1_bias
         
         # Layer 1: Activation (Square)
