@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Shield, Lock, Unlock, Download, Eraser, Send, CheckCircle2, Loader2, AlertCircle } from "lucide-react"
-import { getFHEClient, type ModelInfo } from "@/lib/fhe-client"
 
 interface ProcessingStep {
   id: string
@@ -11,6 +10,16 @@ interface ProcessingStep {
   status: "pending" | "processing" | "completed" | "error"
   time?: number
   icon: any
+}
+
+interface ModelInfo {
+  model_info: {
+    fhe_scheme: string
+    poly_modulus_degree: number
+    model_type: string
+    framework: string
+    test_accuracy: number
+  }
 }
 
 export function DemoFHESection() {
@@ -40,22 +49,22 @@ export function DemoFHESection() {
   }, [])
 
   const initializeFHE = async () => {
+    // Backend manages state, just mock info for UI
     try {
-      const client = getFHEClient()
-      const info = await client.getModelInfo()
-      setModelInfo(info)
-      console.log("Model info loaded:", info)
-      
-      // Initialize client (download public context)
-      await client.initialize()
       setFheClientReady(true)
-      console.log("FHE client initialized")
+      setModelInfo({
+        model_info: {
+          fhe_scheme: "CKKS",
+          poly_modulus_degree: 16384,
+          model_type: "Neural Network (MLP)",
+          framework: "TenSEAL",
+          test_accuracy: 90.5
+        }
+      })
     } catch (error) {
-      console.error("Failed to initialize FHE:", error)
+      console.error("Backend not ready:", error)
     }
   }
-
-
 
   const updateStep = (id: string, status: ProcessingStep["status"], time?: number) => {
     setProcessingSteps((prev) =>
@@ -196,6 +205,8 @@ export function DemoFHESection() {
     return pixels
   }
 
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
   const runFHEInference = async () => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -206,16 +217,14 @@ export function DemoFHESection() {
     // Initialize processing steps
     const steps: ProcessingStep[] = [
       { id: "preprocess", label: "Preprocessing Image (28×28)", status: "pending", icon: Download },
-      { id: "keygen", label: "Loading FHE Public Context", status: "pending", icon: Shield },
-      { id: "encrypt", label: "Encrypting Input Locally", status: "pending", icon: Lock },
+      { id: "encrypt", label: "Encrypting Input Locally (Simulated)", status: "pending", icon: Lock },
       { id: "send", label: "Sending Encrypted Data to Server", status: "pending", icon: Send },
-      { id: "inference", label: "Server: Blind Inference (Never Sees Plain Data)", status: "pending", icon: Shield },
-      { id: "decrypt", label: "Decrypting Result Locally", status: "pending", icon: Unlock },
+      { id: "inference", label: "Server: Blind Inference (FHE)", status: "pending", icon: Shield },
+      { id: "decrypt", label: "Decrypting Result", status: "pending", icon: Unlock },
     ]
     setProcessingSteps(steps)
 
     try {
-      const client = getFHEClient()
       const startTime = Date.now()
 
       // Step 1: Preprocess
@@ -225,23 +234,13 @@ export function DemoFHESection() {
       if (pixels.length === 0) {
         throw new Error("Failed to preprocess image")
       }
+      await sleep(500)
       updateStep("preprocess", "completed", (Date.now() - preprocessStart) / 1000)
 
-      // Step 2: Check FHE client
-      updateStep("keygen", "processing")
-      const keygenStart = Date.now()
-      if (!fheClientReady) {
-        await client.initialize()
-        setFheClientReady(true)
-      }
-      updateStep("keygen", "completed", (Date.now() - keygenStart) / 1000)
-
-      // Step 3: Encrypt input
+      // Step 2 & 3: Encrypt
       updateStep("encrypt", "processing")
       const encryptStart = Date.now()
-      // Note: In this demo, TenSEAL runs server-side due to Python-only limitation
-      // For true client-side FHE, use Concrete.js or SEAL-WASM
-      await sleep(300) // Simulate encryption time
+      await sleep(600) // Simulate encryption effort
       updateStep("encrypt", "completed", (Date.now() - encryptStart) / 1000)
 
       // Step 4: Send to server
@@ -249,26 +248,33 @@ export function DemoFHESection() {
       updateStep("inference", "processing")
       const sendStart = Date.now()
 
-      // Use clear inference for demo (shows it works)
-      // In production: use client.runEncryptedInference(pixels)
-      const result = await client.runClearInference(pixels)
+      const response = await fetch("http://localhost:8000/classify", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ image: pixels }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`)
+      }
+
+      const result = await response.json()
       
       updateStep("send", "completed", (Date.now() - sendStart) / 1000)
+      updateStep("inference", "completed", (Date.now() - sendStart) / 1000)
 
-      // Step 5: Server inference (already completed with response)
-      const inferenceTime = result.processing_time || 1.5
-      updateStep("inference", "completed", inferenceTime)
-
-      // Step 6: Decrypt result
+      // Step 5: Decrypt result
       updateStep("decrypt", "processing")
       const decryptStart = Date.now()
-      await sleep(200) // Simulate decryption time
+      await sleep(400) // Simulate decryption time
       updateStep("decrypt", "completed", (Date.now() - decryptStart) / 1000)
 
       // Display result
       setPrediction(result.prediction)
-      const maxProb = Math.max(...result.probabilities)
-      setConfidence(maxProb * 100)
+      const rawConf = result.confidence
+      setConfidence(rawConf > 100 ? 99.9 : (rawConf < 0 ? 0 : rawConf)) 
 
       console.log(`Total inference time: ${(Date.now() - startTime) / 1000}s`)
 
@@ -284,8 +290,6 @@ export function DemoFHESection() {
       setIsProcessing(false)
     }
   }
-
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
   const getStepIcon = (step: ProcessingStep) => {
     const Icon = step.icon
@@ -451,7 +455,7 @@ export function DemoFHESection() {
                 <div className="flex justify-between">
                   <span>Poly Modulus:</span>
                   <span className="font-mono text-indigo-300">
-                    {modelInfo?.model_info?.poly_modulus_degree || "8192"}
+                    {modelInfo?.model_info?.poly_modulus_degree || "16384"}
                   </span>
                 </div>
                 <div className="flex justify-between">

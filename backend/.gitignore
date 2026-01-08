@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Model Files
+*.pth
+*.pt
+*.onnx
+
+# Data
+data/
+
+# Environment Variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/

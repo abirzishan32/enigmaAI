@@ -9,18 +9,13 @@ python-multipart>=0.0.6
 python-dotenv>=1.0.0
 pydantic>=2.0.0
 
-# FHE and Privacy-Preserving ML
-tenseal>=0.3.14
+# HTTP Client
+requests>=2.31.0
 
-# Machine Learning
+# FHE and ML
+tenseal>=0.3.14
 numpy>=1.24.0
-scikit-learn>=1.3.0
 torch>=2.0.0
 torchvision>=0.15.0
+scikit-learn>=1.3.0
 pandas>=2.0.0
-
-# Optional: LangGraph and LangChain (if needed for other features)
-# langgraph
-# langchain
-# langchain-core
-# langchain-google-genai

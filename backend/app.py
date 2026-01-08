@@ -1,14 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import numpy as np
 import torch
-import torch.nn as nn
 import tenseal as ts
-import json
-from pathlib import Path
-from typing import List, Dict, Any
+import numpy as np
+import base64
+from model import ConvNet
+import os
 
 app = FastAPI(title="FHE Digit Recognition API (TenSEAL)")
 
@@ -24,84 +22,111 @@ app.add_middleware(
 # Global variables
 model = None
 context = None
-model_metadata = None
 
+class ImageInput(BaseModel):
+    image: list  # Expecting a flat list or 2D list of pixel values
 
-class SimpleMNISTNet(nn.Module):
-    """Simple neural network for MNIST digit classification"""
-    def __init__(self):
-        super(SimpleMNISTNet, self).__init__()
-        self.fc1 = nn.Linear(784, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 10)
-        
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
-
-
-class InferenceRequest(BaseModel):
-    pixels: List[float]
-
-
-class EncryptedInferenceRequest(BaseModel):
-    encrypted_input: str  # Base64 encoded encrypted data
-
+def setup_tenseal_context():
+    """
+    Setup TenSEAL context for CKKS scheme.
+    CKKS is good for floating point operations (like neural networks).
+    """
+    # bit_scale: scales the message to preserve precision
+    # poly_modulus_degree: degree of the polynomial modulus (security parameter)
+    # coeff_module_bit_sizes: bit sizes of the coefficient modulus primes
+    # Increasing to 16384 and adding more primes to support depth (Linear -> Square -> Linear)
+    context = ts.context(
+        ts.SCHEME_TYPE.CKKS,
+        poly_modulus_degree=16384,
+        coeff_mod_bit_sizes=[60, 40, 40, 40, 40, 60]
+    )
+    context.global_scale = 2**40
+    context.generate_galois_keys()
+    return context
 
 @app.on_event("startup")
-async def load_model():
-    """Load model and TenSEAL context on startup"""
-    global model, context, model_metadata
+async def startup_event():
+    global model, context
     
+    # Load Model
+    print("Loading model...")
+    device = torch.device("cpu") # TenSEAL works on CPU
+    model = ConvNet().to(device)
+    
+    model_path = "mnist_model.pth"
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+        print("Model loaded successfully.")
+    else:
+        print("Warning: mnist_model.pth not found. Please run train.py first.")
+
+    # Setup TenSEAL
+    print("Setting up TenSEAL context...")
+    context = setup_tenseal_context()
+    print("TenSEAL context ready.")
+
+@app.post("/classify")
+async def classify_digit(payload: ImageInput):
+    global model, context
+    
+    if model is None or context is None:
+        raise HTTPException(status_code=503, detail="Model or Context not initialized")
+
     try:
-        model_path = Path("model.pth")
-        context_path = Path("full_context.bin")
-        metadata_path = Path("metadata.json")
+        # 1. Preprocess Input
+        # Frontend should send 28x28 normalized values (0-1) or we normalize here.
+        # Assuming frontend sends flattened array of 784 float values (0-1).
+        input_data = np.array(payload.image, dtype=np.float32).flatten()
         
-        if model_path.exists() and context_path.exists():
-            print("Loading PyTorch model...")
-            model = SimpleMNISTNet()
-            model.load_state_dict(torch.load(model_path, weights_only=True))
-            model.eval()
-            print("✓ Model loaded successfully!")
-            
-            print("Loading TenSEAL context...")
-            with open(context_path, "rb") as f:
-                context = ts.context_from(f.read())
-            print("✓ TenSEAL context loaded!")
-            
-            if metadata_path.exists():
-                with open(metadata_path, "r") as f:
-                    model_metadata = json.load(f)
-                print(f"✓ Model metadata loaded: Test accuracy = {model_metadata.get('test_accuracy', 'N/A')}%")
-        else:
-            print("⚠ Model not found. Please run train_model_tenseal.py first.")
+        if len(input_data) != 784:
+            raise HTTPException(status_code=400, detail=f"Expected 784 pixels, got {len(input_data)}")
+
+        # 2. Encrypt
+        print("Encrypting input...")
+        # ckks_vector encrypts a vector of float numbers
+        enc_input = ts.ckks_vector(context, input_data)
+
+        # 3. Model Prediction (Homomorphic)
+        print("Running FHE prediction...")
+        # Extract weights and biases from the PyTorch model
+        fc1_weight = model.fc1.weight.data.numpy().T
+        fc1_bias = model.fc1.bias.data.numpy()
+        
+        fc2_weight = model.fc2.weight.data.numpy().T
+        fc2_bias = model.fc2.bias.data.numpy()
+
+        # Layer 1: Linear
+        # enc_hidden = enc_input.mm(fc1_weight) + fc1_bias # TenSEAL .mm() is for matrices, .dot() is for vectors?
+        # For vector inputs and matrix weights: vector * matrix = vector (1x784 * 784x64 = 1x64)
+        # TenSEAL CKKS Vector supports matrix multiplication via .mm or .matmul if one is plain matrix
+        
+        enc_hidden = enc_input.matmul(fc1_weight) + fc1_bias
+        
+        # Layer 1: Activation (Square)
+        enc_hidden.square_() # In-place square
+        
+        # Layer 2: Linear
+        enc_output = enc_hidden.matmul(fc2_weight) + fc2_bias
+        
+        # 4. Decrypt
+        print("Decrypting result...")
+        output_vec = enc_output.decrypt()
+        
+        # 5. Helper: Argmax
+        prediction = int(np.argmax(output_vec))
+        confidence = float(np.max(output_vec)) # Not a real probability without Softmax, but relative score
+
+        return {
+            "prediction": prediction,
+            "confidence": confidence, # Raw score
+            "encrypted": True
+        }
+
     except Exception as e:
-        print(f"✗ Error loading model: {str(e)}")
-
-
-@app.get("/")
-async def root():
-    return {
-        "message": "FHE Digit Recognition API (TenSEAL)",
-        "status": "success",
-        "fhe_enabled": model is not None and context is not None,
-        "framework": "TenSEAL + PyTorch"
-    }
-
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None,
-        "context_loaded": context is not None,
-        "model_metadata": model_metadata
-    }
-
-
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

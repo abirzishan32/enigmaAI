@@ -1,1 +1,15 @@
-/.DS_Store
+# System Files
+.DS_Store
+.id_ed25519
+.id_rsa
+*.log
+
+# Project specific
+backend/venv/
+backend/data/
+backend/*.pth
+backend/__pycache__/
+frontend/.next/
+frontend/node_modules/
+.env
+.env.local
