@@ -19,18 +19,7 @@ export function TechnicalSpecsSection() {
 
   return (
     <section className="relative py-24 bg-[#0A1628] overflow-hidden">
-      {/* Code Pattern Background */}
-      <div className="absolute inset-0 opacity-5 font-mono text-xs">
-        <div className="absolute top-10 left-10">
-          {"const encrypted = seal.encrypt(data);"}
-        </div>
-        <div className="absolute top-32 right-20">
-          {"function shuffle(attrs) { return randomize(attrs); }"}
-        </div>
-        <div className="absolute bottom-20 left-1/4">
-          {"if (tCloseness <= 0.3) { approve(); }"}
-        </div>
-      </div>
+    
 
       <div className="relative z-10 max-w-7xl mx-auto px-6">
         <div className="text-center mb-16">

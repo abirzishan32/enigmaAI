@@ -8,6 +8,11 @@ import { UseCasesSection } from "@/components/sections/use-cases"
 import { ComparisonSection } from "@/components/sections/comparison"
 import { FAQSection } from "@/components/sections/faq"
 import { FooterSection } from "@/components/sections/footer"
+import {
+  GlowingStarsBackgroundCard,
+  GlowingStarsDescription,
+  GlowingStarsTitle,
+} from "@/components/ui/glowing-stars"
 
 export default function Home() {
   return (
@@ -17,21 +22,21 @@ export default function Home() {
       <SolutionSection />
       <HowItWorksSection />
       <FeaturesSection />
-      <HowItWorksSection />
+
       <TechnicalSpecsSection />
       <UseCasesSection />
       <ComparisonSection />
 
 
-      <section className="py-24 bg-slate-950">
-        <div className="container-custom">
-          <div className="max-w-4xl mx-auto bg-gradient-to-br from-indigo-500/10 to-purple-500/10 border border-indigo-500/20 rounded-2xl p-8 md:p-12 text-center relative overflow-hidden group">
-            <div className="absolute inset-0 bg-indigo-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />
-
-            <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Ready to try it yourself?</h2>
-            <p className="text-lg text-slate-400 mb-8 max-w-2xl mx-auto">
+      <section className="py-24 bg-slate-950 flex justify-center">
+        <GlowingStarsBackgroundCard className="max-w-4xl w-full">
+          <div className="flex flex-col items-center text-center">
+            <GlowingStarsTitle className="text-3xl md:text-4xl text-white mb-4">
+              Ready to try it yourself?
+            </GlowingStarsTitle>
+            <GlowingStarsDescription className="text-lg text-slate-400 mb-8 max-w-2xl mx-auto">
               Experience the power of Fully Homomorphic Encryption. Draw a digit and let our secure enclave classify it without ever seeing the raw data.
-            </p>
+            </GlowingStarsDescription>
 
             <a
               href="/digit-recog"
@@ -43,7 +48,7 @@ export default function Home() {
               </svg>
             </a>
           </div>
-        </div>
+        </GlowingStarsBackgroundCard>
       </section>
 
       <FAQSection />
