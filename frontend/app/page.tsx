@@ -6,8 +6,6 @@ import { FeaturesSection } from "@/components/sections/features"
 import { TechnicalSpecsSection } from "@/components/sections/technical-specs"
 import { UseCasesSection } from "@/components/sections/use-cases"
 import { ComparisonSection } from "@/components/sections/comparison"
-import { DemoSection } from "@/components/sections/demo"
-import { DemoFHESection } from "@/components/features/digit-recog"
 import { FAQSection } from "@/components/sections/faq"
 import { FooterSection } from "@/components/sections/footer"
 
@@ -19,10 +17,12 @@ export default function Home() {
       <SolutionSection />
       <HowItWorksSection />
       <FeaturesSection />
+      <HowItWorksSection />
       <TechnicalSpecsSection />
       <UseCasesSection />
       <ComparisonSection />
-      {/* Demo Call to Action */}
+
+
       <section className="py-24 bg-slate-950">
         <div className="container-custom">
           <div className="max-w-4xl mx-auto bg-gradient-to-br from-indigo-500/10 to-purple-500/10 border border-indigo-500/20 rounded-2xl p-8 md:p-12 text-center relative overflow-hidden group">
