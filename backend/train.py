@@ -9,29 +9,36 @@ from model import ConvNet
 def train_model():
     # Parameters
     BATCH_SIZE = 64
-    EPOCHS = 5
+    EPOCHS = 15 # Increased epochs
     LEARNING_RATE = 0.001
     
     # Check device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Transformations
-    transform = transforms.Compose([
+    # Transformations with Augmentation
+    transform_train = transforms.Compose([
+        transforms.RandomRotation(15), # Initial rotation around center
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)), # Small shifts/scales
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)) # MNIST Stats
     ])
 
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
     # Load Data
     print("Downloading MNIST data...")
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform_train)
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform_test)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
     # Model
-    model = ConvNet().to(device)
+    model = ConvNet(hidden=128).to(device) # Matches new default
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 

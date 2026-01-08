@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class ConvNet(nn.Module):
-    def __init__(self, hidden=64):
+    def __init__(self, hidden=128):
         super(ConvNet, self).__init__()
         # We use a simple MLP because CNNs are harder to implement purely in TenSEAL (though possible)
         # without client-side modifications. 
