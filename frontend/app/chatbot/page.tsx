@@ -224,11 +224,11 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
                                         <div className="space-y-1">
                                             <div className="text-muted-foreground uppercase tracking-widest text-[10px] font-bold flex justify-between">
                                                 <span>Sent to Gemini API</span>
-                                                <span className="text-emerald-500">PII Removed</span>
+                                                <span className="text-emerald-500">Synthetic Data Active</span>
                                             </div>
                                             <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded text-emerald-600 dark:text-emerald-400 break-words">
                                                 {/* Highlight Redactions */}
-                                                <RedactedText text={msg.metadata.redacted || ""} />
+                                                <RedactedText text={msg.metadata.redacted || ""} piiMap={msg.metadata.pii_map} />
                                             </div>
                                         </div>
                                         
@@ -237,11 +237,11 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
                                             <div className="pt-2 border-t border-border">
                                                 <div className="text-muted-foreground mb-2">Detected Entities (Stored Locally):</div>
                                                 <div className="grid grid-cols-2 gap-2">
-                                                    {Object.entries(msg.metadata.pii_map).map(([token, val]) => (
-                                                        <div key={token} className="flex justify-between bg-muted p-1.5 rounded border border-border">
-                                                            <span className="text-primary">{token}</span>
+                                                    {Object.entries(msg.metadata.pii_map).map(([fakeVal, original]) => (
+                                                        <div key={fakeVal} className="flex justify-between bg-muted p-1.5 rounded border border-border">
+                                                            <span className="text-primary truncate max-w-[45%]">{original}</span>
                                                             <span className="text-muted-foreground">→</span>
-                                                            <span className="text-foreground truncate pl-2">{val}</span>
+                                                            <span className="text-emerald-500 truncate pl-2 max-w-[45%]">{fakeVal}</span>
                                                         </div>
                                                     ))}
                                                 </div>
@@ -259,14 +259,29 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
     )
 }
 
-function RedactedText({ text }: { text: string }) {
-    // Basic highlighting for <...> tokens
-    const parts = text.split(/(<[^>]+>)/g);
+function RedactedText({ text, piiMap }: { text: string, piiMap?: Record<string, string> }) {
+    if (!piiMap || Object.keys(piiMap).length === 0) {
+        return <span>{text}</span>;
+    }
+
+    // Create a regex pattern from the piiMap keys (fake values)
+    // Escape special characters to be safe
+    const keys = Object.keys(piiMap).sort((a, b) => b.length - a.length); // Longest first to avoid partial matches issues
+    if (keys.length === 0) return <span>{text}</span>;
+
+    const pattern = new RegExp(`(${keys.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
+    
+    const parts = text.split(pattern);
+
     return (
         <span>
             {parts.map((part, i) => {
-                if (part.startsWith("<") && part.endsWith(">")) {
-                    return <span key={i} className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 px-1 rounded mx-0.5 border border-emerald-500/20">{part}</span>
+                if (piiMap.hasOwnProperty(part)) {
+                     return (
+                        <span key={i} className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 px-1 rounded mx-0.5 border border-emerald-500/20 font-medium" title={`Original: ${piiMap[part]}`}>
+                            {part}
+                        </span>
+                     )
                 }
                 return part;
             })}
