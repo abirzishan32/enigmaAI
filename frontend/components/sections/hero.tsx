@@ -13,7 +13,7 @@ export function HeroSection() {
           <div className="flex h-16 items-center justify-between">
             <div className="flex items-center gap-2">
               <Shield className="h-5 w-5 text-primary" strokeWidth={2} />
-              <span className="text-lg font-semibold tracking-tight">PrivacyAsst</span>
+              <span className="text-lg font-semibold tracking-tight">EnigmaAI </span>
             </div>
             
             <div className="hidden md:flex items-center gap-8">
@@ -45,11 +45,7 @@ export function HeroSection() {
       <div className="flex-1 flex items-center">
         <div className="container-custom py-20 md:py-32">
           <div className="max-w-4xl mx-auto text-center space-y-8">
-            {/* Badge */}
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-muted border border-border text-sm font-medium">
-              <FileText className="h-3.5 w-3.5" />
-              <span>Published in IEEE TDSC 2024</span>
-            </div>
+           
 
             {/* Main Headline */}
             <h1 className="font-bold text-foreground">

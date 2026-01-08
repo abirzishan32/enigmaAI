@@ -4,11 +4,11 @@ import { Check, X } from "lucide-react"
 
 export function ComparisonSection() {
   const comparisons = [
-    { feature: "Data Exposure", traditional: false, EnigmaAI: true, traditionalText: "Plaintext", privacyAsstText: "Encrypted" },
-    { feature: "Privacy Guarantee", traditional: false, EnigmaAI: true, traditionalText: "None", privacyAsstText: "Cryptographic" },
-    { feature: "Re-identification Risk", traditional: false, EnigmaAI: true, traditionalText: "High", privacyAsstText: "< 10%" },
-    { feature: "GDPR Compliance", traditional: false, Enigmaai: true, traditionalText: "Partial", privacyAsstText: "Full" },
-    { feature: "Open Source", traditional: false, Enigmaai: true, traditionalText: "Proprietary", privacyAsstText: "MIT License" }
+    { feature: "Data Exposure", traditional: false, enigmaAI: true, traditionalText: "Plaintext", enigmaAIText: "Encrypted" },
+    { feature: "Privacy Guarantee", traditional: false, enigmaAI: true, traditionalText: "None", enigmaAIText: "Cryptographic" },
+    { feature: "Re-identification Risk", traditional: false, enigmaAI: true, traditionalText: "High", enigmaAIText: "< 10%" },
+    { feature: "GDPR Compliance", traditional: false, enigmaAI: true, traditionalText: "Partial", enigmaAIText: "Full" },
+    { feature: "Open Source", traditional: false, enigmaAI: true, traditionalText: "Proprietary", enigmaAIText: "MIT License" }
   ]
 
   return (
@@ -67,7 +67,7 @@ export function ComparisonSection() {
                     <div className="w-6 h-6 rounded-full bg-[#00FFB3]/20 flex items-center justify-center">
                       <Check className="w-4 h-4 text-[#00FFB3]" />
                     </div>
-                    <span className="text-[#B8C5D6]">{item.privacyAsstText}</span>
+                    <span className="text-[#B8C5D6]">{item.enigmaAIText}</span>
                   </div>
                 </div>
               </div>
@@ -78,7 +78,7 @@ export function ComparisonSection() {
         {/* Summary Box */}
         <div className="mt-12 p-8 rounded-2xl bg-gradient-to-br from-[#00D9FF]/10 to-[#00FFB3]/10 border border-[#00D9FF]/30">
           <p className="text-center text-lg text-white">
-            <span className="font-bold text-[#00D9FF]">The Result:</span> PrivacyAsst provides comprehensive privacy protection without sacrificing usability, making it the clear choice for privacy-conscious AI applications.
+            <span className="font-bold text-[#00D9FF]">The Result:</span> EnigmaAI provides comprehensive privacy protection without sacrificing usability, making it the clear choice for privacy-conscious AI applications.
           </p>
         </div>
       </div>

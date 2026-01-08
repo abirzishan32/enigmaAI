@@ -25,11 +25,6 @@ export function FeaturesSection() {
       description: "One-command deployment with full isolation"
     },
     {
-      icon: FileText,
-      title: "Research-Backed",
-      description: "Published in IEEE TDSC 2024, peer-reviewed methodology"
-    },
-    {
       icon: Lock,
       title: "Zero Trust",
       description: "Server never accesses plaintext data"

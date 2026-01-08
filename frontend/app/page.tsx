@@ -7,6 +7,8 @@ import { TechnicalSpecsSection } from "@/components/sections/technical-specs"
 import { UseCasesSection } from "@/components/sections/use-cases"
 import { ComparisonSection } from "@/components/sections/comparison"
 import { DemoSection } from "@/components/sections/demo"
+import { DemoFHESection } from "@/components/sections/demo-fhe"
+import { FAQSection } from "@/components/sections/faq"
 import { FooterSection } from "@/components/sections/footer"
 
 export default function Home() {
@@ -20,7 +22,8 @@ export default function Home() {
       <TechnicalSpecsSection />
       <UseCasesSection />
       <ComparisonSection />
-      <DemoSection />
+      <DemoFHESection />
+      <FAQSection />
       <FooterSection />
     </main>
   )
