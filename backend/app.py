@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import torch
 import tenseal as ts
 import numpy as np
-from model import ConvNet
+from digit_recognition.model import ConvNet
 from routers import chat
 
 app = FastAPI(title="FHE Digit Recognition API (TenSEAL)")

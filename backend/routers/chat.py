@@ -45,6 +45,60 @@ def get_fake_pii(label):
         return fake.phone_number()
     return f"[{label}]"
 
+def is_personal_context(doc, ent):
+    """
+    Determine if an entity is likely strictly personal (needs redaction).
+    Strict Heuristic:
+    1. Direct Ownership: "My [Entity]"
+    2. Personal State Verbs: Subject "I" + Verb "live/am/born/etc"
+    
+    If it's just a general action verb ("visit", "go"), we default to PRESERVE.
+    """
+    
+    # 1. Check for Direct Ownership ("My name", "My city")
+    # Traverse left children of the entity's root
+    for child in ent.root.children:
+        if child.dep_ == "poss" and child.text.lower() in ["my", "our"]:
+            return True
+    
+    # Check if header of entity has ownership ("My name is Alice")
+    # Entity "Alice" -> Head "is" -> Subject "name" -> Child "My"
+    head = ent.root.head
+    if head.pos_ == "NOUN":
+        for child in head.children:
+             if child.dep_ == "poss" and child.text.lower() in ["my", "our"]:
+                 return True
+
+    # 2. Check Verb-Subject Relation
+    # Find the main verb
+    verb = head
+    while verb.pos_ != "VERB" and verb.pos_ != "AUX" and verb.head != verb:
+        verb = verb.head
+        
+    PERSONAL_STATE_VERBS = {"live", "am", "born", "work", "study", "moved", "stay", "reside", "from"}
+    
+    # Special Handle for "be" verbs (am, is, was) mapping to lemma "be"
+    # But checking raw text is safer for "am"
+    
+    if verb.pos_ in ["VERB", "AUX"]:
+        # Check if subject is 1st person
+        has_first_person_subject = False
+        for child in verb.children:
+            if child.dep_ in ["nsubj", "nsubjpass"] and child.text.lower() in ["i", "we", "me", "us"]:
+                has_first_person_subject = True
+                break
+        
+        # If subject is I/We, check if the verb is a "Personal State" verb
+        if has_first_person_subject:
+            # Check lemma or text
+            if verb.lemma_.lower() in ["be", "live", "work", "study", "stay", "reside", "born", "move"]:
+                 return True
+            # Also check if it's "am" specifically
+            if verb.text.lower() == "am":
+                return True
+                
+    return False
+
 @router.post("/chat/secure")
 async def secure_chat(payload: ChatInput):
     if not nlp:
@@ -67,22 +121,36 @@ async def secure_chat(payload: ChatInput):
         sensitive_labels = ["PERSON", "GPE", "LOC", "ORG", "PHONE", "EMAIL"]
         entities = list(doc.ents)
         replacements = []
-        
+        preserved_items = {} # Map of text -> label
+        global_preserved_texts = set()
+
+        # Phase 1: Identify Global Erasure Exceptions (Preservation)
+        # If an entity is used in a non-personal (query) context ANYWHERE in the message,
+        # we preserve it EVERYWHERE to maintain consistency for the LLM.
+        for ent in entities:
+             if ent.label_ in ["GPE", "LOC", "ORG"]:
+                 # Check if this specific instance is strictly personal
+                 is_personal = is_personal_context(doc, ent)
+                 if not is_personal:
+                     global_preserved_texts.add(ent.text)
+
         # Maintain consistency for the same entity text in this session
         session_map = {} 
         
         for ent in entities:
             if ent.label_ in sensitive_labels:
+                
+                # Check Global Preservation
+                if ent.text in global_preserved_texts:
+                    preserved_items[ent.text] = ent.label_
+                    continue
+                
+                # Proceed to Redact
                 if ent.text in session_map:
                     fake_val = session_map[ent.text]
                 else:
                     fake_val = get_fake_pii(ent.label_)
                     session_map[ent.text] = fake_val
-                
-                # We map the fake value BACK to the original for restoration
-                # But wait, if we have multiple "Alice" -> "Janice", we need to map "Janice" -> "Alice"
-                # But what if "Bob" also maps to "Janice"? (Unlikely with Faker but possible)
-                # For this simple implementation, we assume collision is rare enough.
                 
                 pii_map[fake_val] = ent.text
                 replacements.append((ent.start_char, ent.end_char, fake_val))
@@ -107,7 +175,9 @@ async def secure_chat(payload: ChatInput):
             "redacted_prompt": redacted_text,
             "llm_response_raw": llm_response,
             "llm_response_restored": restored_response,
-            "pii_map": pii_map
+            "llm_response_restored": restored_response,
+            "pii_map": pii_map,
+            "preserved_items": preserved_items
         }
     except Exception as e:
         traceback.print_exc()

@@ -1,4 +1,4 @@
-
+// Context-Aware Redaction
 "use client";
 
 import { useState, useRef, useEffect } from "react";
@@ -15,6 +15,7 @@ interface ChatMessage {
     original?: string;
     redacted?: string;
     pii_map?: Record<string, string>;
+    preserved_items?: Record<string, string>;
     raw_response?: string;
   };
 }
@@ -59,6 +60,7 @@ export default function SecureChatbotPage() {
           original: data.original_prompt,
           redacted: data.redacted_prompt,
           pii_map: data.pii_map,
+          preserved_items: data.preserved_items,
           raw_response: data.llm_response_raw
         }
       };
@@ -175,11 +177,11 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
                {isUser ? <div className="w-4 h-4 bg-secondary-foreground/50 rounded-full" /> : <Bot className="w-4 h-4 text-primary" />}
             </div>
 
-            <div className={`flex flex-col gap-2 max-w-[85%] ${isUser ? "items-end" : "items-start"}`}>
-                <div className={`rounded-2xl p-4 text-sm leading-relaxed prose dark:prose-invert max-w-none ${
+            <div className={`flex flex-col gap-2 max-w-[85%] ${isUser ? "items-end" : "items-start w-full"}`}>
+                <div className={`text-sm max-w-none ${
                     isUser 
-                    ? "bg-primary text-primary-foreground rounded-tr-none" 
-                    : "bg-card border border-border text-card-foreground rounded-tl-none"
+                    ? "bg-primary text-primary-foreground rounded-2xl rounded-tr-none p-4 leading-relaxed [&>p]:mb-2 [&>p:last-child]:mb-0 [&>ul]:list-disc [&>ul]:pl-4" 
+                    : "text-foreground pl-0 py-2 leading-8 w-full prose dark:prose-invert"
                     }`}>
                     <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>
@@ -227,8 +229,12 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
                                                 <span className="text-emerald-500">Synthetic Data Active</span>
                                             </div>
                                             <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded text-emerald-600 dark:text-emerald-400 break-words">
-                                                {/* Highlight Redactions */}
-                                                <RedactedText text={msg.metadata.redacted || ""} piiMap={msg.metadata.pii_map} />
+                                                {/* Highlight Redactions and Preservation */}
+                                                <RedactedText 
+                                                    text={msg.metadata.redacted || ""} 
+                                                    piiMap={msg.metadata.pii_map} 
+                                                    preservedItems={msg.metadata.preserved_items}
+                                                />
                                             </div>
                                         </div>
                                         
@@ -248,6 +254,24 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
                                             </div>
                                         )}
 
+                                        {/* Preserved Entities */}
+                                        {msg.metadata.preserved_items && Object.keys(msg.metadata.preserved_items).length > 0 && (
+                                            <div className="pt-2 border-t border-border">
+                                                <div className="text-muted-foreground mb-2 flex items-center gap-2">
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                                                    Preserved Context (Public):
+                                                </div>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {Object.entries(msg.metadata.preserved_items).map(([text, label]) => (
+                                                        <div key={text} className="flex items-center gap-2 bg-blue-500/10 border border-blue-500/20 px-2 py-1 rounded text-blue-400">
+                                                            <span>{text}</span>
+                                                            <span className="text-[9px] uppercase opacity-50 bg-blue-500/20 px-1 rounded">{label}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+
                                     </div>
                                 </motion.div>
                             )}
@@ -259,30 +283,43 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
     )
 }
 
-function RedactedText({ text, piiMap }: { text: string, piiMap?: Record<string, string> }) {
-    if (!piiMap || Object.keys(piiMap).length === 0) {
-        return <span>{text}</span>;
-    }
+function RedactedText({ text, piiMap, preservedItems }: { 
+    text: string, 
+    piiMap?: Record<string, string>,
+    preservedItems?: Record<string, string>
+}) {
+    const piiKeys = piiMap ? Object.keys(piiMap) : [];
+    const preservedKeys = preservedItems ? Object.keys(preservedItems) : [];
+    
+    // Combine keys (Fake Tokens AND Preserved Real Text)
+    const allKeys = [...piiKeys, ...preservedKeys].sort((a, b) => b.length - a.length);
 
-    // Create a regex pattern from the piiMap keys (fake values)
-    // Escape special characters to be safe
-    const keys = Object.keys(piiMap).sort((a, b) => b.length - a.length); // Longest first to avoid partial matches issues
-    if (keys.length === 0) return <span>{text}</span>;
+    if (allKeys.length === 0) return <span>{text}</span>;
 
-    const pattern = new RegExp(`(${keys.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
+    // Escape and build pattern
+    const pattern = new RegExp(`(${allKeys.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
+    
+    // ... splitting logic same ...
     
     const parts = text.split(pattern);
 
     return (
         <span>
             {parts.map((part, i) => {
-                if (piiMap.hasOwnProperty(part)) {
+                if (piiMap && piiMap.hasOwnProperty(part)) {
                      return (
-                        <span key={i} className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 px-1 rounded mx-0.5 border border-emerald-500/20 font-medium" title={`Original: ${piiMap[part]}`}>
+                        <span key={i} className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 px-1 rounded mx-0.5 border border-emerald-500/20 font-medium cursor-help" title={`Original: ${piiMap[part]}`}>
                             {part}
                         </span>
                      )
                 }
+                if (preservedItems && preservedItems.hasOwnProperty(part)) {
+                    return (
+                       <span key={i} className="bg-blue-500/10 text-blue-400 px-1 rounded mx-0.5 border border-blue-500/20 font-medium cursor-help" title={`Preserved Entity: ${preservedItems[part]} (Query Context)`}>
+                           {part}
+                       </span>
+                    )
+               }
                 return part;
             })}
         </span>

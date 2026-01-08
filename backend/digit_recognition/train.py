@@ -4,7 +4,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
-from model import ConvNet
+from digit_recognition.model import ConvNet
 
 def train_model():
     # Parameters
