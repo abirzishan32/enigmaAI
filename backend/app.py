@@ -11,7 +11,7 @@ import torch
 import tenseal as ts
 import numpy as np
 from digit_recognition.model import ConvNet
-from routers import chat
+from routers import chat, sentiment
 
 app = FastAPI(title="FHE Digit Recognition API (TenSEAL)")
 
@@ -24,8 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Chat Router
+# Include Routers
 app.include_router(chat.router)
+app.include_router(sentiment.router)
 
 # Global variables
 model = None
@@ -73,6 +74,11 @@ async def startup_event():
     print("Setting up TenSEAL context...")
     context = setup_tenseal_context()
     print("TenSEAL context ready.")
+    
+    # Load Sentiment Analysis Model
+    print("Loading sentiment analysis model...")
+    sentiment.load_sentiment_model()
+
 
 @app.post("/classify")
 async def classify_digit(payload: ImageInput):
