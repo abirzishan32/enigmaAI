@@ -19,7 +19,7 @@ function LiveTerminal({ logs }: { logs: LogEntry[] }) {
   }, [logs])
 
   return (
-    <div className="bg-card border border-border rounded-xl overflow-hidden shadow-sm h-[600px] flex flex-col">
+    <div className="bg-card border border-border rounded-xl overflow-hidden shadow-sm h-[400px] flex flex-col">
       <div className="bg-muted px-4 py-3 border-b border-border flex items-center justify-between">
         <div className="flex items-center gap-2">
             <TerminalIcon className="w-4 h-4 text-muted-foreground" />
@@ -191,11 +191,11 @@ export function DigitRecog() {
   }
 
   return (
-    <div className="container-custom">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+    <div className="container-custom h-full flex items-center py-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 w-full">
             
             {/* LEFT COLUMN: Workflow Stepper */}
-            <div className="lg:col-span-2 space-y-4">
+            <div className="lg:col-span-2 space-y-3 max-h-[calc(100vh-8rem)] overflow-y-auto pr-2">
                 {/* Step 1: Encrypt */}
                 <StepItem 
                     stepNumber={1} 
@@ -210,8 +210,8 @@ export function DigitRecog() {
                             <div className="bg-slate-200 dark:bg-slate-800 p-1 rounded-lg">
                                 <canvas
                                     ref={canvasRef}
-                                    width={280}
-                                    height={280}
+                                    width={240}
+                                    height={240}
                                     className="bg-white rounded cursor-crosshair touch-none shadow-inner"
                                     onMouseDown={startDrawing}
                                     onMouseMove={draw}
@@ -253,12 +253,12 @@ export function DigitRecog() {
                     badgeType="server"
                     onToggle={() => { if(completedSteps.includes(2) || completedSteps.includes(1)) setActiveStep(2) }}
                 >
-                     <div className="flex flex-col items-center gap-6">
-                        <div className="p-6 bg-slate-950 rounded-xl border border-slate-800 shadow-inner">
+                     <div className="flex flex-col items-center gap-4">
+                        <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 shadow-inner">
                             {noiseImage ? (
-                                <img src={noiseImage} alt="Noise" className="w-[200px] h-[200px] rounded opacity-80 mix-blend-screen" />
+                                <img src={noiseImage} alt="Noise" className="w-[160px] h-[160px] rounded opacity-80 mix-blend-screen" />
                             ) : (
-                                <div className="w-[200px] h-[200px] flex items-center justify-center text-slate-600">
+                                <div className="w-[160px] h-[160px] flex items-center justify-center text-slate-600">
                                     <span className="text-xs">No Ciphertext</span>
                                 </div>
                             )}
@@ -291,16 +291,16 @@ export function DigitRecog() {
                     badgeType="client"
                     onToggle={() => { if(completedSteps.includes(2)) setActiveStep(3) }}
                 >
-                     <div className="flex flex-col items-center gap-6">
-                        <div className="flex items-center justify-center min-h-[160px]">
+                     <div className="flex flex-col items-center gap-4">
+                        <div className="flex items-center justify-center min-h-[120px]">
                             {completedSteps.includes(3) && prediction !== null ? (
                                 <motion.div 
                                     initial={{ scale: 0.5, opacity: 0 }}
                                     animate={{ scale: 1, opacity: 1 }}
                                     className="text-center"
                                 >
-                                    <p className="text-sm text-muted-foreground mb-2 uppercase tracking-widest">The Model Predicted</p>
-                                    <div className="text-9xl font-bold bg-clip-text text-transparent bg-gradient-to-br from-indigo-500 to-purple-600 drop-shadow-xl">
+                                    <p className="text-xs text-muted-foreground mb-1 uppercase tracking-widest">The Model Predicted</p>
+                                    <div className="text-7xl font-bold bg-clip-text text-transparent bg-gradient-to-br from-indigo-500 to-purple-600 drop-shadow-xl">
                                         {prediction}
                                     </div>
                                 </motion.div>
