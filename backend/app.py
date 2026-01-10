@@ -88,48 +88,57 @@ async def classify_digit(payload: ImageInput):
         raise HTTPException(status_code=503, detail="Model or Context not initialized")
 
     try:
-        # 1. Preprocess Input
-        # Frontend should send 28x28 normalized values (0-1) or we normalize here.
-        # Assuming frontend sends flattened array of 784 float values (0-1).
-        input_data = np.array(payload.image, dtype=np.float32).flatten()
+
+        input_data = np.array(payload.image, dtype=np.float32).flatten() # 1D NumPy array of 784 float values.
+                                                                        # Transforms the raw image into a format the AI model understands
         
-        if len(input_data) != 784:
+
+        if len(input_data) != 784: # Validates that the image has exactly 784 pixels (28×28)
             raise HTTPException(status_code=400, detail=f"Expected 784 pixels, got {len(input_data)}")
 
-        # 2. Encrypt
-        print("Encrypting input...")
-        # ckks_vector encrypts a vector of float numbers
-        enc_input = ts.ckks_vector(context, input_data)
 
-        # 3. Model Prediction (Homomorphic)
-        print("Running FHE prediction...")
-        # Extract weights and biases from the PyTorch model
+
+        
+
+        enc_input = ts.ckks_vector(context, input_data) # CKKS encodes each float as a complex number inside a polynomial ring. The encryption makes it mathematically impossible to recover the original pixels without the secret key
+                                                        # Image is now encrypted. The server cannot see the actual pixels.
+
+
+
+
+        # The server retrieves the AI model's learned knowledge (weights and biases from training)
         fc1_weight = model.fc1.weight.data.numpy().T
         fc1_bias = model.fc1.bias.data.numpy()
-        
         fc2_weight = model.fc2.weight.data.numpy().T
         fc2_bias = model.fc2.bias.data.numpy()
 
-        # Layer 1: Linear
+
+
+        # Encrypted input (784 pixels) 
+        # × Weights (784 → 128)
+        # + Biases (128)
+        # = Encrypted hidden activations (128 neurons)
         enc_hidden = enc_input.matmul(fc1_weight) + fc1_bias
         
-        # Layer 1: Activation (Square)
-        enc_hidden.square_() # In-place square
+
+        enc_hidden.square_() # Applied an activation function to the encrypted hidden layer
         
-        # Layer 2: Linear
-        enc_output = enc_hidden.matmul(fc2_weight) + fc2_bias
+
+        enc_output = enc_hidden.matmul(fc2_weight) + fc2_bias # Server completed the entire neural network inference. 
+                                                                # Got 10 encrypted prediction scores (one per digit 0-9). 
+                                                                #  Still no decryption - all encrypted!
         
-        # 4. Decrypt
-        print("Decrypting result...")
+
+
         output_vec = enc_output.decrypt()
         
-        # 5. Helper: Argmax
+
         prediction = int(np.argmax(output_vec))
-        confidence = float(np.max(output_vec)) # Not a real probability without Softmax, but relative score
+        confidence = float(np.max(output_vec)) 
 
         return {
             "prediction": prediction,
-            "confidence": confidence, # Raw score
+            "confidence": confidence,
             "encrypted": True
         }
 

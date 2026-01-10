@@ -4,14 +4,23 @@ import { Button } from "@/components/ui/button"
 import { ArrowRight, Lock, Shuffle, Cpu } from "lucide-react"
 import Link from "next/link"
 import { Vortex } from "@/components/ui/vortex"
+import { useTheme } from "next-themes"
+import { useEffect, useState } from "react"
 
 export function HowItWorksSection() {
+    const { resolvedTheme } = useTheme();
+    const [backgroundFill, setBackgroundFill] = useState("black");
+    
+      useEffect(() => {
+        setBackgroundFill(resolvedTheme === "dark" ? "black" : "white");
+      }, [resolvedTheme]);
+
   return (
     <section className="w-full bg-black overflow-hidden relative">
       <Vortex
-         backgroundColor="black"
+         backgroundColor={backgroundFill}
          rangeY={800}
-         particleCount={500}
+         particleCount={1000}
          baseHue={220}
          className="flex items-center flex-col justify-center px-2 md:px-10 py-10 w-full h-full"
       >

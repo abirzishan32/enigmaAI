@@ -22,12 +22,7 @@ export function TechnicalSpecsSection() {
     
 
       <div className="relative z-10 max-w-7xl mx-auto px-6">
-        <div className="text-center mb-16">
-          <h2 className="text-4xl md:text-5xl font-bold text-white mb-4">
-            Built on Cutting-Edge Technology
-          </h2>
-          <div className="w-24 h-1 bg-gradient-to-r from-[#00D9FF] to-[#00FFB3] mx-auto"></div>
-        </div>
+        
 
         <div className="grid lg:grid-cols-2 gap-12">
           {/* LEFT: Technology Stack */}

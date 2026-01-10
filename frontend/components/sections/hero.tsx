@@ -24,7 +24,7 @@ export function HeroSection() {
             backgroundFill={backgroundFill}
             blur={10}
             speed="fast"
-            waveOpacity={0.5}
+            waveOpacity={0.9}
         >
             <div className="text-center space-y-8 px-4">
                 {/* Main Headline */}
