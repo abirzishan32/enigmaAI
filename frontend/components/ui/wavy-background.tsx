@@ -35,8 +35,27 @@ export const WavyBackground = ({
     ctx: any,
     canvas: any;
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Refs to hold latest prop values
+  const backgroundFillRef = useRef(backgroundFill);
+  const waveOpacityRef = useRef(waveOpacity);
+  const waveWidthRef = useRef(waveWidth);
+  const blurRef = useRef(blur);
+  const speedRef = useRef(speed);
+  const colorsRef = useRef(colors);
+
+  // Update refs when props change
+  useEffect(() => {
+    backgroundFillRef.current = backgroundFill;
+    waveOpacityRef.current = waveOpacity;
+    waveWidthRef.current = waveWidth;
+    blurRef.current = blur;
+    speedRef.current = speed;
+    colorsRef.current = colors;
+  }, [backgroundFill, waveOpacity, waveWidth, blur, speed, colors]);
+
   const getSpeed = () => {
-    switch (speed) {
+    switch (speedRef.current) {
       case "slow":
         return 0.001;
       case "fast":
@@ -51,29 +70,33 @@ export const WavyBackground = ({
     ctx = canvas.getContext("2d");
     w = ctx.canvas.width = window.innerWidth;
     h = ctx.canvas.height = window.innerHeight;
-    ctx.filter = `blur(${blur}px)`;
+    ctx.filter = `blur(${blurRef.current}px)`;
     nt = 0;
     window.onresize = function () {
       w = ctx.canvas.width = window.innerWidth;
       h = ctx.canvas.height = window.innerHeight;
-      ctx.filter = `blur(${blur}px)`;
+      ctx.filter = `blur(${blurRef.current}px)`;
     };
     render();
   };
 
-  const waveColors = colors ?? [
+  const defaultColors = [
     "#38bdf8",
     "#818cf8",
     "#c084fc",
     "#e879f9",
     "#22d3ee",
   ];
+
   const drawWave = (n: number) => {
     nt += getSpeed();
+    const currentColors = colorsRef.current ?? defaultColors;
+    const currentWaveWidth = waveWidthRef.current || 50;
+
     for (i = 0; i < n; i++) {
       ctx.beginPath();
-      ctx.lineWidth = waveWidth || 50;
-      ctx.strokeStyle = waveColors[i % waveColors.length];
+      ctx.lineWidth = currentWaveWidth;
+      ctx.strokeStyle = currentColors[i % currentColors.length];
       for (x = 0; x < w; x += 5) {
         var y = noise(x / 800, 0.3 * i, nt) * 100;
         ctx.lineTo(x, y + h * 0.5); // adjust for height, currently at 50% of the container
@@ -85,8 +108,8 @@ export const WavyBackground = ({
 
   let animationId: number;
   const render = () => {
-    ctx.fillStyle = backgroundFill || "black";
-    ctx.globalAlpha = waveOpacity || 0.5;
+    ctx.fillStyle = backgroundFillRef.current || "black";
+    ctx.globalAlpha = waveOpacityRef.current || 0.5;
     ctx.fillRect(0, 0, w, h);
     drawWave(5);
     animationId = requestAnimationFrame(render);
