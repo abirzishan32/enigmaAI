@@ -96,7 +96,7 @@ export default function SecureChatbotPage() {
             </div>
           </div>
           <div className="text-xs text-primary bg-primary/10 px-3 py-1 rounded-full border border-primary/20 hidden sm:block">
-            PII Redaction Engine: BERT NER
+            PII Redaction Engine: BERT NERrr
           </div>
         </div>
       </header>
