@@ -104,6 +104,7 @@ export default function SecureChatbotPage() {
       {/* Main Chat Area */}
       <main className="flex-1 w-full max-w-5xl mx-auto p-4 flex flex-col gap-4 overflow-hidden">
         
+
         {messages.length === 0 && (
           <div className="flex-1 flex flex-col items-center justify-center text-center space-y-4 opacity-50">
             <Shield className="w-16 h-16 text-muted-foreground" />
@@ -180,8 +181,8 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
             <div className={`flex flex-col gap-2 max-w-[85%] ${isUser ? "items-end" : "items-start w-full"}`}>
                 <div className={`text-sm max-w-none ${
                     isUser 
-                    ? "bg-primary text-primary-foreground rounded-2xl rounded-tr-none p-4 leading-relaxed [&>p]:mb-2 [&>p:last-child]:mb-0 [&>ul]:list-disc [&>ul]:pl-4" 
-                    : "text-foreground pl-0 py-2 leading-8 w-full prose dark:prose-invert"
+                    ? "bg-primary text-primary-foreground rounded-2xl rounded-tr-none px-3 py-2.5 leading-relaxed [&>p]:mb-2 [&>p:last-child]:mb-0 [&>ul]:list-disc [&>ul]:pl-4" 
+                    : "text-foreground px-0 py-2 leading-8 w-full prose dark:prose-invert"
                     }`}>
                     <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>

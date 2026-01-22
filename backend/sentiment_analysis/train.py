@@ -123,7 +123,7 @@ def train_model():
     joblib.dump(vectorizer, "sentiment_vectorizer.pkl")
     joblib.dump(['Negative', 'Neutral', 'Positive'], "sentiment_labels.pkl")
     
-    print("\n✅ Training complete!")
+    print("\n Training complete!")
     print(f"   - Model saved to: sentiment_model.pth")
     print(f"   - Vectorizer saved to: sentiment_vectorizer.pkl")
     print(f"   - Labels saved to: sentiment_labels.pkl")

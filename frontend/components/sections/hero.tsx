@@ -48,21 +48,7 @@ export function HeroSection() {
                 </Button>
                 </div>
 
-                {/* Trust Indicators */}
-                <div className="flex flex-wrap justify-center gap-8 pt-12 text-sm text-black/60 dark:text-white/60">
-                <div className="flex items-center gap-2">
-                    <div className="h-1.5 w-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]" />
-                    <span>128-bit Security</span>
-                </div>
-                <div className="flex items-center gap-2">
-                    <div className="h-1.5 w-1.5 rounded-full bg-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.8)]" />
-                    <span>Open Source</span>
-                </div>
-                <div className="flex items-center gap-2">
-                    <div className="h-1.5 w-1.5 rounded-full bg-pink-400 shadow-[0_0_8px_rgba(232,121,249,0.8)]" />
-                    <span>GDPR Compliant</span>
-                </div>
-                </div>
+                
             </div>
         </WavyBackground>
     </section>
