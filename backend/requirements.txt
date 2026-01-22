@@ -13,6 +13,9 @@ faker>=20.0.0
 # HTTP Client
 requests>=2.31.0
 
+# NLP / Transformers
+transformers>=4.30.0
+
 # FHE and ML
 tenseal>=0.3.14
 numpy>=1.24.0

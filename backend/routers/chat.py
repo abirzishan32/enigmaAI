@@ -6,15 +6,27 @@ import google.generativeai as genai
 import os
 import traceback
 from faker import Faker
+from transformers import pipeline
+import re
 
 router = APIRouter()
 fake = Faker()
 
-# Initialize Spacy
+# Initialize Spacy (for syntactic parsing/context only)
 try:
     nlp = spacy.load("en_core_web_sm")
 except:
+    print("Warning: Spacy model not found. Context analysis will be limited.")
     nlp = None
+
+# Initialize BERT NER
+try:
+    print("Loading BERT NER model...")
+    ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+    print("BERT NER model loaded.")
+except Exception as e:
+    print(f"Error loading BERT model: {e}")
+    ner_pipeline = None
 
 # Initialize Gemini
 def get_gemini_model():
@@ -112,48 +124,113 @@ async def secure_chat(payload: ChatInput):
 
     original_text = payload.message
     try:
-        doc = nlp(original_text)
+        # 1. BERT NER Extraction
+        bert_entities = []
+        if ner_pipeline:
+            bert_entities = ner_pipeline(original_text)
+        
+        # 2. Regex for Pattern-based PII (Email, Phone) - BERT doesn't catch these well
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        phone_pattern = r'\b(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})\b'
+        
+        regex_entities = []
+        for match in re.finditer(email_pattern, original_text):
+            regex_entities.append({
+                "entity_group": "EMAIL", 
+                "word": match.group(), 
+                "start": match.start(), 
+                "end": match.end()
+            })
+            
+        for match in re.finditer(phone_pattern, original_text):
+             regex_entities.append({
+                "entity_group": "PHONE", 
+                "word": match.group(), 
+                "start": match.start(), 
+                "end": match.end()
+            })
+
+        # Combine entities
+        all_detected_entities = bert_entities + regex_entities
+        
+        # Parse with Spacy for Context Analysis (Dependencies)
+        doc = None
+        if nlp:
+            doc = nlp(original_text)
         
         # Redaction Logic
         redacted_text = original_text
         pii_map = {}
         
-        sensitive_labels = ["PERSON", "GPE", "LOC", "ORG", "PHONE", "EMAIL"]
-        entities = list(doc.ents)
+        # Map BERT labels to our standard labels
+        label_map = {
+            "PER": "PERSON",
+            "ORG": "ORG",
+            "LOC": "LOC",
+            "MISC": "MISC",
+            "EMAIL": "EMAIL",
+            "PHONE": "PHONE"
+        }
+        
         replacements = []
         preserved_items = {} # Map of text -> label
         global_preserved_texts = set()
 
         # Phase 1: Identify Global Erasure Exceptions (Preservation)
-        # If an entity is used in a non-personal (query) context ANYWHERE in the message,
-        # we preserve it EVERYWHERE to maintain consistency for the LLM.
-        for ent in entities:
-             if ent.label_ in ["GPE", "LOC", "ORG"]:
-                 # Check if this specific instance is strictly personal
-                 is_personal = is_personal_context(doc, ent)
+        for ent in all_detected_entities:
+             label = label_map.get(ent["entity_group"], ent["entity_group"])
+             text = ent["word"]
+             
+             if label in ["GPE", "LOC", "ORG"]:
+                 # Context Check using Spacy
+                 is_personal = False
+                 if doc:
+                     # Find corresponding Spacy span
+                     # formatting note: BERT 'start'/'end' are character indices
+                     span = doc.char_span(ent["start"], ent["end"])
+                     # If exact match fails (tokenization diffs), try alignment
+                     if not span:
+                          # Fallback: simple text search in doc if char_span is strict
+                          span = doc.char_span(ent["start"], ent["end"], alignment_mode="expand")
+                     
+                     if span:
+                         # We treat the found span as a named entity for our heuristic function
+                         # The heuristic expects a spaCy Span object with root/head attributes
+                         is_personal = is_personal_context(doc, span)
+                 
                  if not is_personal:
-                     global_preserved_texts.add(ent.text)
+                     global_preserved_texts.add(text)
 
         # Maintain consistency for the same entity text in this session
         session_map = {} 
         
-        for ent in entities:
-            if ent.label_ in sensitive_labels:
+        # Maintain consistency for the same entity text in this session
+        session_map = {} 
+        
+        # Process all entities for redaction
+        for ent in all_detected_entities:
+            label = label_map.get(ent["entity_group"], ent["entity_group"])
+            text = ent["word"]
+            start = ent["start"]
+            end = ent["end"]
+
+            # Filter relevant labels
+            if label in ["PERSON", "GPE", "LOC", "ORG", "PHONE", "EMAIL", "MISC"]:
                 
                 # Check Global Preservation
-                if ent.text in global_preserved_texts:
-                    preserved_items[ent.text] = ent.label_
+                if text in global_preserved_texts:
+                    preserved_items[text] = label
                     continue
                 
                 # Proceed to Redact
-                if ent.text in session_map:
-                    fake_val = session_map[ent.text]
+                if text in session_map:
+                    fake_val = session_map[text]
                 else:
-                    fake_val = get_fake_pii(ent.label_)
-                    session_map[ent.text] = fake_val
+                    fake_val = get_fake_pii(label)
+                    session_map[text] = fake_val
                 
-                pii_map[fake_val] = ent.text
-                replacements.append((ent.start_char, ent.end_char, fake_val))
+                pii_map[fake_val] = text
+                replacements.append((start, end, fake_val))
                 
         # Apply replacements in reverse order
         replacements.sort(key=lambda x: x[0], reverse=True)
