@@ -114,24 +114,26 @@ export default function SecureChatbotPage() {
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto space-y-6 pr-2" ref={scrollRef}>
-          {messages.map((msg, idx) => (
-            <MessageItem key={idx} msg={msg} />
-          ))}
-          {isLoading && (
-             <div className="flex gap-4">
-                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20">
-                    <Bot className="w-4 h-4 text-primary" />
-                </div>
-                <div className="bg-card border border-border rounded-2xl rounded-tl-none p-4 w-fit">
-                    <div className="flex gap-1">
-                        <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-0" />
-                        <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-150" />
-                        <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-300" />
-                    </div>
-                </div>
-             </div>
-          )}
+        <div className="flex-1 overflow-y-auto" ref={scrollRef}>
+          <div className="space-y-6 pr-4">
+            {messages.map((msg, idx) => (
+              <MessageItem key={idx} msg={msg} />
+            ))}
+            {isLoading && (
+               <div className="flex gap-4">
+                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20">
+                      <Bot className="w-4 h-4 text-primary" />
+                  </div>
+                  <div className="bg-card border border-border rounded-2xl rounded-tl-none p-4 w-fit">
+                      <div className="flex gap-1">
+                          <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-0" />
+                          <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-150" />
+                          <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-300" />
+                      </div>
+                  </div>
+               </div>
+            )}
+          </div>
         </div>
 
         {/* Input Area */}
