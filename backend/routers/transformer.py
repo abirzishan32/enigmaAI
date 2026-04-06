@@ -2,9 +2,9 @@
 
 # ── Standard Library ─────────────────────────────────────────────────────────
 import asyncio
+import json
 import logging
 import os
-import random
 import re
 import time
 from contextlib import asynccontextmanager
@@ -30,7 +30,6 @@ import spacy
 import nltk
 from nltk.corpus import wordnet as wn
 
-from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics.pairwise import rbf_kernel
 
@@ -55,8 +54,22 @@ CACHE_DIR         = Path("./model_cache")
 BERT_CACHE_FILE   = CACHE_DIR / "bert_common_word_vectors.pt"
 N_COMMON_WORDS    = 10_000
 MAX_BERT_TOKENS   = 512
-KMEANS_N_CLUSTERS = 8
 MASK_TOKEN        = "[MASK]"
+
+# Absolute high/low thresholds used by ALSA Table-1 action rules.
+PLRS_HIGH_THRESHOLD = 0.55
+CIIS_HIGH_THRESHOLD = 0.55
+TRS_HIGH_THRESHOLD  = 0.55
+
+# Exposure risk is calibrated against fixed NLL bounds (absolute scale),
+# not re-normalised within each prompt.
+EXPOSURE_RISK_MIN_NLL = 2.0
+EXPOSURE_RISK_MAX_NLL = 12.0
+
+# NER contributions are intentionally soft so they cannot dominate PLRS.
+NER_ENTITY_BOOST = 0.25
+NER_PROPN_BOOST  = 0.15
+NER_FUSION_WEIGHT = 0.20
 
 # ── Llama-3 Backbone (TRS + Encrypt Self-Recommendation) ─────────────
 LLAMA_MODEL_NAME          = "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
@@ -308,6 +321,19 @@ def _robust_scale_1d(arr: np.ndarray) -> np.ndarray:
     return ((arr - lo) / (hi - lo + 1e-9)).astype(np.float32)
 
 
+def _fixed_range_scale_1d(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """
+    Absolute scaling to [0, 1] using a fixed numeric range.
+
+    This avoids context-relative behaviour where each prompt is always
+    stretched to the full range regardless of absolute magnitude.
+    """
+    if hi <= lo:
+        raise ValueError("Invalid fixed scaling range: hi must be > lo")
+    scaled = (arr - lo) / (hi - lo)
+    return np.clip(scaled, 0.0, 1.0).astype(np.float32)
+
+
 # ── BERT embedding helpers ────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -444,9 +470,8 @@ def compute_ner_sensitivity_boost(
     E.g. "John Smith" will be tagged PERSON by SpaCy.
 
     Returns a boost array (n_words,) in [0, 1]:
-        SENSITIVE_NER_LABELS  → 0.4 boost  (reduced from 0.6 to prevent
-                                            over-amplification of PLRS)
-        PROPN (proper noun)   → 0.3 boost
+        SENSITIVE_NER_LABELS  → 0.25 boost
+        PROPN (proper noun)   → 0.15 boost
         Others                → 0.0
 
     NOTE: The boost is used ADDITIVELY (not as an override) when fused
@@ -462,14 +487,14 @@ def compute_ner_sensitivity_boost(
         if ent.label_ in SENSITIVE_NER_LABELS:
             for i, (ws, we) in enumerate(word_spans):
                 if ws < ent.end_char and we > ent.start_char:
-                    boost[i] = max(boost[i], 0.4)
+                    boost[i] = max(boost[i], NER_ENTITY_BOOST)
 
     # ── PROPN (proper noun) — catches names SpaCy didn't tag as entities ─
     for tok in doc:
         if tok.pos_ == "PROPN" and not tok.is_space:
             for i, w in enumerate(words):
                 if tok.text.lower() == strip_punctuation(w).lower():
-                    boost[i] = max(boost[i], 0.3)
+                    boost[i] = max(boost[i], NER_PROPN_BOOST)
 
     return boost
 
@@ -558,6 +583,11 @@ def compute_exposure_risk(
     whose first BPE token is at position 0 receive the mean NLL.
 
     Returns: np.ndarray (n_words,) in [0, 1]
+
+    IMPORTANT:
+    Exposure scores are mapped with FIXED NLL bounds to preserve an
+    absolute interpretation across prompts. This avoids the bug where
+    per-prompt min-max scaling makes one word hit 1.0 by construction.
     """
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -612,7 +642,11 @@ def compute_exposure_risk(
                     tok_nlls.append(nll_val)
         word_nlls.append(float(np.mean(tok_nlls)) if tok_nlls else mean_nll)
 
-    return _robust_scale_1d(np.array(word_nlls, dtype=np.float32))
+    return _fixed_range_scale_1d(
+        np.array(word_nlls, dtype=np.float32),
+        EXPOSURE_RISK_MIN_NLL,
+        EXPOSURE_RISK_MAX_NLL,
+    )
 
 
 def compute_plrs(
@@ -632,9 +666,11 @@ def compute_plrs(
 
         PLRS_raw_i = 0.5 × Intrinsic_i + 0.5 × Exposure_i
 
-    Then merged with PII/NER override:
+    Then merged with PII/NER signals:
 
-        PLRS_i = max( PLRS_raw_i, PII_override_i, NER_boost_i )
+        PLRS_i = max( PLRS_raw_i + λ·NER_boost_i, PII_override_i )
+
+    where λ = NER_FUSION_WEIGHT (soft additive contribution).
 
     WHY additive? The multiplicative formula `A × B` collapses to 0 if
     either A or B is 0 (which happens after min-max normalisation when
@@ -653,9 +689,9 @@ def compute_plrs(
     pii_override = compute_pii_override_scores(words, prompt)
     ner_boost    = compute_ner_sensitivity_boost(words, prompt, spacy_nlp)
 
-    # NER boost is ADDITIVE (not override) — preserves statistical ranking.
-    # PII regex patterns always override (they are hard-confirmed).
-    plrs = np.clip(plrs_raw + 0.5 * ner_boost, 0.0, 1.0)
+    # NER boost is soft-additive, never a hard override.
+    # PII regex patterns always override (hard-confirmed identifiers).
+    plrs = np.clip(plrs_raw + NER_FUSION_WEIGHT * ner_boost, 0.0, 1.0)
     plrs = np.maximum(plrs, pii_override).astype(np.float32)
 
     return plrs, pii_override
@@ -883,15 +919,15 @@ def assign_actions_kmeans(
     pii_override: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Task 4.2 — Two-stage Action Assignment (ALSA Paper Table 1).
+    Task 4.2 — Deterministic Action Assignment (ALSA Paper Table 1).
 
     STAGE 1 — PII Hard Override (before K-Means):
         If a word matched a PII regex (pii_override ≥ 0.9) → force Encrypt.
         This guarantees SSNs, emails, phone numbers are ALWAYS masked.
 
-    STAGE 2 — K-Means in [PLRS, CIIS, TRS] space:
-        For all remaining words, cluster and apply the FULL 8-case
-        decision table from ALSA Paper Table 1:
+    STAGE 2 — Per-word Table Rule:
+        For all remaining words, apply the FULL 8-case decision table
+        directly using fixed high/low thresholds.
 
         ┌──────┬──────┬──────┬──────────┐
         │ PLRS │ CIIS │ TRS  │ Action   │
@@ -907,7 +943,8 @@ def assign_actions_kmeans(
         └──────┴──────┴──────┴──────────┘
 
     Returns:
-        cluster_ids : np.ndarray (n_words,)
+        cluster_ids : np.ndarray (n_words,) where each id encodes
+                      (PLRS_high, CIIS_high, TRS_high) as a 3-bit value.
         actions     : np.ndarray (n_words, dtype=object)
     """
     n = len(plrs)
@@ -918,45 +955,45 @@ def assign_actions_kmeans(
     pii_mask = pii_override >= 0.9  # regex-confirmed PII
     actions[pii_mask] = "Encrypt"
 
-    # ── Stage 2: K-Means for the rest ──────────────────────────────────
+    # ── Stage 2: Direct ALSA table mapping for the rest ────────────────
     remaining_idx = np.where(~pii_mask)[0]
     if len(remaining_idx) == 0:
         return cluster_ids, actions
 
-    X = np.stack([plrs, ciis, trs], axis=1).astype(np.float64)  # (n, 3)
-    k = min(KMEANS_N_CLUSTERS, len(remaining_idx), n)
-    km = KMeans(n_clusters=k, n_init=15, random_state=42)
-    all_cluster_ids = km.fit_predict(X)   # fit on all n points for consistency
-    cluster_ids[:] = all_cluster_ids
-    centroids = km.cluster_centers_       # (k, 3)
+    plrs_high = plrs >= PLRS_HIGH_THRESHOLD
+    ciis_high = ciis >= CIIS_HIGH_THRESHOLD
+    trs_high  = trs  >= TRS_HIGH_THRESHOLD
 
-    mean_plrs = plrs.mean()
-    mean_ciis = ciis.mean()
-    mean_trs  = trs.mean()
-
-    # Cluster → action mapping (ALSA Paper Table 1 — full 8-case table)
-    cluster_action: Dict[int, str] = {}
-    for c in range(k):
-        cp, cc, ct = centroids[c]
-        p_high = cp > mean_plrs
-        c_high = cc > mean_ciis
-        t_high = ct > mean_trs
-
-        if p_high and c_high:                  # (H, H, *) → Encrypt
-            cluster_action[c] = "Encrypt"
-        elif p_high and not c_high and t_high: # (H, L, H) → Replace
-            cluster_action[c] = "Replace"
-        elif p_high and not c_high and not t_high:  # (H, L, L) → Delete
-            cluster_action[c] = "Delete"
-        elif not p_high and c_high:            # (L, H, *) → Retain
-            cluster_action[c] = "Retain"
-        elif not p_high and not c_high and t_high:  # (L, L, H) → Retain
-            cluster_action[c] = "Retain"
-        else:                                  # (L, L, L) → Delete
-            cluster_action[c] = "Delete"
+    # 3-bit state for inspection/debugging:
+    # bit2=PLRS, bit1=CIIS, bit0=TRS
+    cluster_ids = (
+        (plrs_high.astype(np.int32) << 2)
+        | (ciis_high.astype(np.int32) << 1)
+        | trs_high.astype(np.int32)
+    )
 
     for i in remaining_idx:
-        actions[i] = cluster_action.get(int(cluster_ids[i]), "Retain")
+        p_high = bool(plrs_high[i])
+        c_high = bool(ciis_high[i])
+        t_high = bool(trs_high[i])
+
+        # ALSA Table 1 exact mapping.
+        if p_high and c_high and t_high:
+            actions[i] = "Encrypt"
+        elif p_high and c_high and not t_high:
+            actions[i] = "Encrypt"
+        elif p_high and not c_high and t_high:
+            actions[i] = "Replace"
+        elif p_high and not c_high and not t_high:
+            actions[i] = "Delete"
+        elif not p_high and c_high and t_high:
+            actions[i] = "Retain"
+        elif not p_high and c_high and not t_high:
+            actions[i] = "Retain"
+        elif not p_high and not c_high and t_high:
+            actions[i] = "Retain"
+        else:  # (L, L, L)
+            actions[i] = "Delete"
 
     return cluster_ids, actions
 
@@ -981,6 +1018,28 @@ def _build_masked_prompt(words: List[str], actions: np.ndarray) -> str:
     return " ".join(out)
 
 
+def _contains_sensitive_patterns(text: str) -> bool:
+    """Conservative regex check to prevent regenerated PII in candidates."""
+    for pattern, _ in PII_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _safe_mask_fallback(masked_prompt: str) -> str:
+    """
+    Deterministic fallback when no safe LLM candidate is available.
+    Replaces each [MASK] with synthetic non-identifying placeholders.
+    """
+    counter = {"n": 0}
+
+    def repl(_: re.Match) -> str:
+        counter["n"] += 1
+        return f"REDACTED_TOKEN_{counter['n']}"
+
+    return re.sub(re.escape(MASK_TOKEN), repl, masked_prompt)
+
+
 async def _generate_encrypt_candidates(
     masked_prompt: str,
     original_prompt: str,
@@ -997,42 +1056,72 @@ async def _generate_encrypt_candidates(
     alternative expressions that preserve semantic integrity."
     """
     query = (
-        f"Below is a prompt with [MASK] tokens replacing sensitive information.\n\n"
-        f"Masked prompt: \"{masked_prompt}\"\n\n"
-        f"Generate {n_candidates} different versions of this prompt where each [MASK] "
-        f"is replaced with a FICTIONAL, NON-IDENTIFYING substitute. Rules:\n"
-        f"- Names must be clearly fictional (e.g. 'Person A')\n"
-        f"- Numbers must be obviously fake placeholders (e.g. 'XXX-XX-XXXX')\n"
-        f"- Medical/legal terms should be replaced with generic categories "
-        f"(e.g. 'a medical condition', 'a medication')\n"
-        f"- Preserve the sentence structure and grammatical correctness\n"
-        f"- Do NOT use real-sounding names, addresses, or identifying details\n\n"
-        f"Format your response as:\n"
-        + "".join(f"{i+1}. <completed prompt>\n" for i in range(n_candidates))
-        + "\nProvide ONLY the numbered prompts, nothing else."
+        "You are a privacy-preserving rewrite engine.\n"
+        "Your ONLY goal is to replace [MASK] tokens with synthetic, non-identifying "
+        "content while preserving task meaning.\n\n"
+        "STRICT SAFETY CONSTRAINTS (MUST FOLLOW):\n"
+        "1) Never output real personal names, emails, phone numbers, SSNs, account IDs, "
+        "addresses, IPs, or dates.\n"
+        "2) Every replacement must be synthetic placeholders such as: PERSON_A, PERSON_B, "
+        "ORG_A, LOCATION_A, DATE_TOKEN, ID_TOKEN, EMAIL_TOKEN, PHONE_TOKEN, CONDITION_TOKEN, "
+        "MEDICATION_TOKEN, AMOUNT_TOKEN.\n"
+        "3) Keep sentence intent, tense, and grammatical structure.\n"
+        "4) Do not add new facts beyond what is implied by the masked prompt.\n"
+        "5) Output complete prompts with NO [MASK] remaining.\n"
+        "6) Output must be JSON only: an array of exactly "
+        f"{n_candidates} strings and nothing else.\n\n"
+        f"Original prompt (for meaning only): \"{original_prompt}\"\n"
+        f"Masked prompt (rewrite this): \"{masked_prompt}\"\n"
     )
     try:
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None, _llama_generate, query, ENCRYPT_CANDIDATE_TOKENS
         )
+        raw_candidates: List[str] = []
+
+        # Preferred path: strict JSON array.
+        json_match = re.search(r'\[[\s\S]*\]', response)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                if isinstance(parsed, list):
+                    raw_candidates.extend(str(x).strip() for x in parsed)
+            except json.JSONDecodeError:
+                log.warning("Candidate JSON parse failed; falling back to line parser")
+
+        # Fallback parser for numbered lines.
+        if not raw_candidates:
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                match = re.match(r'^\d+\.\s*(.+)$', line)
+                if match:
+                    raw_candidates.append(match.group(1).strip())
+
         candidates: List[str] = []
-        for line in response.strip().split("\n"):
-            line = line.strip()
-            match = re.match(r'^\d+\.\s*(.+)$', line)
-            if match:
-                candidate = match.group(1).strip().strip('"').strip("'")
-                if candidate:
-                    candidates.append(candidate)
+        seen: set = set()
+        for cand in raw_candidates:
+            candidate = cand.strip().strip('"').strip("'")
+            if not candidate or MASK_TOKEN in candidate:
+                continue
+            if candidate == original_prompt:
+                continue
+            if _contains_sensitive_patterns(candidate):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+            if len(candidates) >= n_candidates:
+                break
 
         if not candidates:
-            log.warning("No candidates parsed from LLM response, falling back")
-            return [masked_prompt]
+            log.warning("No safe candidates parsed from LLM response, using deterministic fallback")
+            return [_safe_mask_fallback(masked_prompt)]
 
-        return candidates[:n_candidates]
+        return candidates
     except Exception as exc:
         log.warning("Encrypt candidate generation failed: %s", exc)
-        return [masked_prompt]
+        return [_safe_mask_fallback(masked_prompt)]
 
 
 async def _score_candidates(
@@ -1279,17 +1368,21 @@ TEST_CASES = [
     # 2. Heavy PII — personal information + SSN
     "My name is John Smith and my social security number is 432-91-8765.",
 
+    "You can reach Dr. Emily Carter at random34241@gmail.com or call her private cell at 555-019-8372",
+
+    "Patient Sarah Jenkins, born on 11/14/1985, recently tested positive for the BRCA1 genetic mutation",
+
     # 3. Highly technical jargon
-    "The convolutional neural network uses backpropagation and gradient "
-    "descent to optimise the cross-entropy loss.",
+    # "The convolutional neural network uses backpropagation and gradient "
+    # "descent to optimise the cross-entropy loss.",
 
     # 4. Medical context with sensitive data
-    "Patient Alice Johnson aged 54 has been diagnosed with stage-3 "
-    "pancreatic adenocarcinoma and is prescribed gemcitabine.",
+    # "Patient Alice Johnson aged 54 has been diagnosed with stage-3 "
+    # "pancreatic adenocarcinoma and is prescribed gemcitabine.",
 
     # 5. Legal / financial context
-    "The defendant transferred 2.4 million dollars to an offshore account "
-    "in the Cayman Islands on March 15th.",
+    # "The defendant transferred 2.4 million dollars to an offshore account "
+    # "in the Cayman Islands on March 15th.",
 ]
 
 
