@@ -1001,7 +1001,7 @@ async def _generate_encrypt_candidates(
         f"Masked prompt: \"{masked_prompt}\"\n\n"
         f"Generate {n_candidates} different versions of this prompt where each [MASK] "
         f"is replaced with a FICTIONAL, NON-IDENTIFYING substitute. Rules:\n"
-        f"- Names must be clearly fictional (e.g. 'Person A', 'Entity X')\n"
+        f"- Names must be clearly fictional (e.g. 'Person A')\n"
         f"- Numbers must be obviously fake placeholders (e.g. 'XXX-XX-XXXX')\n"
         f"- Medical/legal terms should be replaced with generic categories "
         f"(e.g. 'a medical condition', 'a medication')\n"
