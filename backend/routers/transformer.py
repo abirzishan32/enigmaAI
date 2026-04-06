@@ -71,6 +71,11 @@ NER_ENTITY_BOOST = 0.25
 NER_PROPN_BOOST  = 0.15
 NER_FUSION_WEIGHT = 0.20
 
+# Replace-action quality controls.
+REPLACE_MIN_FREQUENCY = 2
+REPLACE_MIN_SEMANTIC_SIM = 0.90
+REPLACE_MAX_CANDIDATES = 10
+
 # ── Llama-3 Backbone (TRS + Encrypt Self-Recommendation) ─────────────
 LLAMA_MODEL_NAME          = "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
 TRS_NUM_ITERS             = 5           # k in TRS(w_i) = (1/k) Σ LLM_j(w_i|P)
@@ -113,6 +118,17 @@ PII_PATTERNS: List[Tuple[re.Pattern, float]] = [
 # are excluded because they tag non-identifying values (ages, stages,
 # percentages) that should NOT be auto-escalated.
 SENSITIVE_NER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "MONEY"}
+
+# spaCy POS to WordNet POS mapping for POS-safe synonym retrieval.
+_SPACY_TO_WN_POS: Dict[str, str] = {
+    "NOUN": wn.NOUN,
+    "VERB": wn.VERB,
+    "ADJ": wn.ADJ,
+    "ADV": wn.ADV,
+}
+
+# Lazy Brown-corpus frequency cache used to avoid obscure replacements.
+_BROWN_FREQ_CACHE: Optional[Dict[str, int]] = None
 
 
 # ── Global Model Registry ──────────────────────────────────────────────────────
@@ -300,6 +316,68 @@ def get_word_char_spans(words: List[str], text: str) -> List[Tuple[int, int]]:
         spans.append((idx, idx + len(w)))
         cursor = idx + len(w)
     return spans
+
+
+def _get_brown_frequency_map() -> Dict[str, int]:
+    """Load Brown word frequencies once for replacement naturalness scoring."""
+    global _BROWN_FREQ_CACHE
+    if _BROWN_FREQ_CACHE is None:
+        from nltk.corpus import brown
+        nltk.download("brown", quiet=True)
+        freq: Dict[str, int] = {}
+        for w in brown.words():
+            lw = w.lower()
+            if lw.isalpha():
+                freq[lw] = freq.get(lw, 0) + 1
+        _BROWN_FREQ_CACHE = freq
+    return _BROWN_FREQ_CACHE
+
+
+def _word_frequency(word: str) -> int:
+    return int(_get_brown_frequency_map().get(word.lower(), 0))
+
+
+def _frequency_score(word: str) -> float:
+    """Frequency proxy in [0, 1] for lexical naturalness."""
+    freq = _word_frequency(strip_punctuation(word))
+    return float(np.clip(np.log1p(freq) / np.log1p(5000.0), 0.0, 1.0))
+
+
+def _apply_surface_form(source_word: str, replacement: str) -> str:
+    """Preserve source casing and edge punctuation for a replacement token."""
+    m = re.match(r"^([^\w]*)([\w'-]+)([^\w]*)$", source_word)
+    if not m:
+        return replacement
+
+    prefix, core, suffix = m.groups()
+    rep = replacement
+    if core.isupper():
+        rep = rep.upper()
+    elif core.istitle():
+        rep = rep.title()
+    return f"{prefix}{rep}{suffix}"
+
+
+def _get_word_pos_tags(words: List[str], prompt: str, spacy_nlp: spacy.Language) -> List[str]:
+    """Map each split-word to the best-overlap spaCy POS tag."""
+    doc = spacy_nlp(prompt)
+    spans = get_word_char_spans(words, prompt)
+    tags: List[str] = []
+
+    for ws, we in spans:
+        best_overlap = 0
+        best_pos = "X"
+        for tok in doc:
+            if tok.is_space:
+                continue
+            ts, te = tok.idx, tok.idx + len(tok.text)
+            overlap = max(0, min(we, te) - max(ws, ts))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_pos = tok.pos_
+        tags.append(best_pos)
+
+    return tags
 
 
 def _robust_scale_1d(arr: np.ndarray) -> np.ndarray:
@@ -752,18 +830,191 @@ def compute_contextual_coherence(
 
 
 def get_wordnet_synonyms(word: str, n: int = 5) -> List[str]:
-    """WordNet synonyms — single-token only, excluding the word itself."""
+    """
+    WordNet synonyms with optional POS filtering and rarity suppression.
+
+    `target_pos` should be a spaCy POS tag (NOUN/VERB/ADJ/ADV).
+    """
+    return get_wordnet_synonyms_with_pos(word, n=n, target_pos=None)
+
+
+def get_wordnet_synonyms_with_pos(
+    word: str,
+    n: int = 5,
+    target_pos: Optional[str] = None,
+) -> List[str]:
+    """POS-safe WordNet synonyms ranked by corpus frequency."""
+    clean = strip_punctuation(word)
+    wn_pos = _SPACY_TO_WN_POS.get(target_pos or "")
+    synsets = wn.synsets(clean, pos=wn_pos) if wn_pos else wn.synsets(clean)
+
     syns: List[str] = []
-    for synset in wn.synsets(strip_punctuation(word)):
+    for synset in synsets:
         for lemma in synset.lemmas():
             cand = lemma.name().replace("_", " ")
-            if cand.lower() != word.lower() and " " not in cand:
+            if cand.lower() != clean.lower() and " " not in cand and cand.isalpha():
                 syns.append(cand)
+
     seen, unique = set(), []
     for s in syns:
         if s.lower() not in seen:
             seen.add(s.lower()); unique.append(s)
-    return unique[:n]
+
+    if not unique:
+        return []
+
+    natural = [s for s in unique if _word_frequency(s) >= REPLACE_MIN_FREQUENCY]
+    ranked = natural if natural else unique
+    ranked.sort(key=lambda s: (_frequency_score(s), -abs(len(s) - len(clean))), reverse=True)
+    return ranked[:n]
+
+
+@torch.no_grad()
+def _sentence_semantic_similarity(a: str, b: str) -> float:
+    """Cosine similarity of BERT [CLS] sentence embeddings."""
+    emb = embed_sentences_bert(
+        [a, b],
+        registry.bert_tokenizer,
+        registry.bert_model,
+        registry.device,
+    ).numpy()
+    va, vb = emb[0], emb[1]
+    denom = (np.linalg.norm(va) * np.linalg.norm(vb)) + 1e-9
+    return float(np.dot(va, vb) / denom)
+
+
+@torch.no_grad()
+def _sentence_fluency_score(text: str) -> float:
+    """Higher is better; computed as negative mean GPT-2 token NLL."""
+    tok = registry.gpt2_tokenizer
+    mdl = registry.gpt2_model
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    enc = tok(text, return_tensors="pt")
+    enc = {k: v.to(registry.device) for k, v in enc.items()}
+    out = mdl(**enc)
+
+    logits = out.logits[0, :-1, :]
+    target = enc["input_ids"][0, 1:]
+    if len(target) == 0:
+        return -5.0
+
+    probs = F.softmax(logits, dim=-1)
+    token_probs = probs[range(len(target)), target]
+    mean_nll = float((-torch.log2(token_probs + 1e-9)).mean().item())
+    return -mean_nll
+
+
+def _llm_suggest_contextual_replacement(
+    source_word: str,
+    source_pos: str,
+    sentence: str,
+) -> Optional[str]:
+    """Optional one-token replacement from LLM with strict constraints."""
+    query = (
+        "You are performing lexical substitution in one sentence.\n"
+        "Return one COMMON English replacement token for the target word.\n"
+        "Rules:\n"
+        "- Keep the same part-of-speech.\n"
+        "- Preserve sentence meaning.\n"
+        "- One token only (letters only).\n"
+        "- Avoid rare/archaic/technical words.\n"
+        "- Return JSON only: {\"replacement\":\"word\"}.\n\n"
+        f"Sentence: \"{sentence}\"\n"
+        f"Target word: \"{strip_punctuation(source_word)}\"\n"
+        f"Target POS: {source_pos}\n"
+    )
+
+    try:
+        response = _llama_generate(query, max_tokens=24)
+        match = re.search(r'\{[\s\S]*\}', response)
+        if match:
+            parsed = json.loads(match.group(0))
+            replacement = str(parsed.get("replacement", "")).strip()
+        else:
+            fallback = re.search(r"([A-Za-z]+)", response)
+            replacement = fallback.group(1) if fallback else ""
+
+        if not replacement or not replacement.isalpha():
+            return None
+        if _contains_sensitive_patterns(replacement):
+            return None
+        return replacement.lower()
+    except Exception:
+        return None
+
+
+def _select_replacement_word(
+    working_words: List[str],
+    word_idx: int,
+    original_prompt: str,
+    source_pos: str,
+) -> str:
+    """Context-aware lexical substitution for Replace action."""
+    source_word = working_words[word_idx]
+    if source_pos not in {"NOUN", "VERB", "ADJ", "ADV"}:
+        return source_word
+
+    candidate_pool = get_wordnet_synonyms_with_pos(
+        source_word,
+        n=REPLACE_MAX_CANDIDATES,
+        target_pos=source_pos,
+    )
+
+    llm_candidate = _llm_suggest_contextual_replacement(
+        source_word,
+        source_pos,
+        " ".join(working_words),
+    )
+    if llm_candidate and llm_candidate not in candidate_pool:
+        candidate_pool.append(llm_candidate)
+
+    if not candidate_pool:
+        return source_word
+
+    evaluated: List[Tuple[str, float, float, float]] = []
+    for cand in candidate_pool:
+        surface = _apply_surface_form(source_word, cand)
+        if strip_punctuation(surface).lower() == strip_punctuation(source_word).lower():
+            continue
+
+        trial_words = working_words.copy()
+        trial_words[word_idx] = surface
+        trial_prompt = " ".join(trial_words)
+
+        trial_pos = _get_word_pos_tags(trial_words, trial_prompt, registry.spacy_nlp)[word_idx]
+        if trial_pos != source_pos:
+            continue
+
+        sim = _sentence_semantic_similarity(original_prompt, trial_prompt)
+        if sim < REPLACE_MIN_SEMANTIC_SIM:
+            continue
+
+        fluency = _sentence_fluency_score(trial_prompt)
+        freq = _frequency_score(surface)
+        evaluated.append((surface, sim, fluency, freq))
+
+    if not evaluated:
+        return source_word
+
+    if len(evaluated) == 1:
+        return evaluated[0][0]
+
+    fluencies = np.array([x[2] for x in evaluated], dtype=np.float32)
+    f_min, f_max = float(fluencies.min()), float(fluencies.max())
+    f_span = f_max - f_min + 1e-9
+
+    best_word = source_word
+    best_score = -1e9
+    for word, sim, fluency, freq in evaluated:
+        fluency_norm = (fluency - f_min) / f_span
+        score = 0.55 * sim + 0.30 * float(fluency_norm) + 0.15 * freq
+        if score > best_score:
+            best_score = score
+            best_word = word
+
+    return best_word
 
 
 def compute_semantic_distinctiveness(
@@ -921,7 +1172,7 @@ def assign_actions_kmeans(
     """
     Task 4.2 — Deterministic Action Assignment (ALSA Paper Table 1).
 
-    STAGE 1 — PII Hard Override (before K-Means):
+    STAGE 1 — PII Hard Override (before table rules):
         If a word matched a PII regex (pii_override ≥ 0.9) → force Encrypt.
         This guarantees SSNs, emails, phone numbers are ALWAYS masked.
 
@@ -1004,18 +1255,32 @@ def _build_masked_prompt(words: List[str], actions: np.ndarray) -> str:
     Encrypt words become [MASK], Replace uses WordNet synonyms,
     Delete is omitted, Retain is kept verbatim.
     """
-    out: List[str] = []
-    for word, action in zip(words, actions):
-        if action == "Retain":
-            out.append(word)
-        elif action == "Delete":
-            pass
-        elif action == "Replace":
-            syns = get_wordnet_synonyms(word, n=3)
-            out.append(syns[0] if syns else word)
+    return _build_masked_prompt_contextual(words, actions, " ".join(words))
+
+
+def _build_masked_prompt_contextual(
+    words: List[str],
+    actions: np.ndarray,
+    original_prompt: str,
+) -> str:
+    """Action application with context-aware lexical replacement."""
+    out_words = words.copy()
+    pos_tags = _get_word_pos_tags(words, original_prompt, registry.spacy_nlp)
+
+    for i, action in enumerate(actions):
+        if action == "Delete":
+            out_words[i] = ""
         elif action == "Encrypt":
-            out.append(MASK_TOKEN)
-    return " ".join(out)
+            out_words[i] = MASK_TOKEN
+        elif action == "Replace":
+            out_words[i] = _select_replacement_word(
+                out_words,
+                i,
+                original_prompt,
+                pos_tags[i],
+            )
+
+    return " ".join(w for w in out_words if w)
 
 
 def _contains_sensitive_patterns(text: str) -> bool:
@@ -1196,7 +1461,7 @@ async def reconstruct_prompt_with_llm(
         masked_prompt    : str        — intermediate [MASK] version
         encrypt_candidates : List[str] — all candidates considered
     """
-    masked_prompt = _build_masked_prompt(words, actions)
+    masked_prompt = _build_masked_prompt_contextual(words, actions, original_prompt)
 
     # If no [MASK] tokens, no self-recommendation needed
     if MASK_TOKEN not in masked_prompt:
@@ -1363,14 +1628,14 @@ async def analyse_prompt(body: PromptRequest):
 
 TEST_CASES = [
     # 1. Standard everyday sentence
-    "The quick brown fox jumps over the lazy dog near the river.",
+    # "The quick brown fox jumps over the lazy dog near the river.",
 
     # 2. Heavy PII — personal information + SSN
     "My name is John Smith and my social security number is 432-91-8765.",
 
-    "You can reach Dr. Emily Carter at random34241@gmail.com or call her private cell at 555-019-8372",
+    # "You can reach Dr. Emily Carter at random34241@gmail.com or call her private cell at 555-019-8372",
 
-    "Patient Sarah Jenkins, born on 11/14/1985, recently tested positive for the BRCA1 genetic mutation",
+    # "Patient Sarah Jenkins, born on 11/14/1985, recently tested positive for the BRCA1 genetic mutation",
 
     # 3. Highly technical jargon
     # "The convolutional neural network uses backpropagation and gradient "
