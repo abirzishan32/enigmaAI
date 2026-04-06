@@ -19,7 +19,6 @@ import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — safe for server/script use
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from mpl_toolkits.mplot3d import Axes3D  # enable 3D projection
 
 from transformers import (
     AutoModel,
@@ -60,7 +59,7 @@ KMEANS_N_CLUSTERS = 8
 MASK_TOKEN        = "[MASK]"
 
 # ── Llama-3 Backbone (TRS + Encrypt Self-Recommendation) ─────────────
-LLAMA_MODEL_NAME          = " mlx-community/Meta-Llama-3-8B-Instruct-4bit"
+LLAMA_MODEL_NAME          = "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
 TRS_NUM_ITERS             = 5           # k in TRS(w_i) = (1/k) Σ LLM_j(w_i|P)
 TRS_FALLBACK_SCORE        = 0.5         # graceful fallback if LLM fails
 TRS_MAX_TOKENS            = 16          # response is a single float
@@ -168,9 +167,6 @@ def _llama_generate(prompt_text: str, max_tokens: int = 16) -> str:
     Applies the Llama-3 Instruct chat template for proper formatting,
     then generates up to *max_tokens* of output.
 
-    Post-processing: strips Llama-3 template markers (<|eot_id|>,
-    <|start_header_id|>, etc.) that can leak into generated text.
-
     This function is SYNCHRONOUS and runs on the MLX Metal backend.
     It should be called from async code via ``run_in_executor``.
     """
@@ -179,16 +175,10 @@ def _llama_generate(prompt_text: str, max_tokens: int = 16) -> str:
     formatted = registry.llama_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    raw = mlx_generate(
+    return mlx_generate(
         registry.llama_model, registry.llama_tokenizer,
         prompt=formatted, max_tokens=max_tokens, verbose=False,
     )
-    # Strip everything from first <|eot_id|> onwards, then remove
-    # any remaining template markers like <|start_header_id|> etc.
-    if "<|eot_id|>" in raw:
-        raw = raw[:raw.index("<|eot_id|>")]
-    raw = re.sub(r'<\|[^|]*\|>', '', raw)
-    return raw.strip()
 
 
 def _build_bert_common_vectors(tokenizer, model, device) -> torch.Tensor:
@@ -725,43 +715,10 @@ def compute_contextual_coherence(
     return _robust_scale_1d(distances)
 
 
-# SpaCy POS → WordNet POS mapping (for synset filtering)
-_SPACY_TO_WN_POS: Dict[str, Optional[str]] = {
-    "NOUN": wn.NOUN, "PROPN": None,  # never use WordNet for proper nouns
-    "VERB": wn.VERB, "ADJ": wn.ADJ, "ADV": wn.ADV,
-}
-
-# Function-word POS tags that should NEVER be sensitive
-FUNCTION_WORD_POS = {"ADP", "DET", "CCONJ", "SCONJ", "PART", "PUNCT"}
-
-
-def get_wordnet_synonyms(
-    word: str, n: int = 5, pos_tag: Optional[str] = None,
-) -> List[str]:
-    """
-    WordNet synonyms — single-token only, excluding the word itself.
-
-    POS-aware filtering:
-      - PROPN (proper nouns): returns [] immediately — WordNet has no
-        useful synsets for person names ("john" → toilet is wrong).
-      - Other POS: filters synsets to the matching WordNet POS to avoid
-        cross-POS contamination (e.g. verb sense of "dog").
-      - If pos_tag is None, all synsets are used (backward compatibility).
-    """
-    clean = strip_punctuation(word)
-    if not clean:
-        return []
-
-    # Proper nouns: never use WordNet ("John" → toilet is wrong)
-    if pos_tag == "PROPN":
-        return []
-
-    # Map SpaCy POS to WordNet POS for filtering
-    wn_pos = _SPACY_TO_WN_POS.get(pos_tag) if pos_tag else None
-
+def get_wordnet_synonyms(word: str, n: int = 5) -> List[str]:
+    """WordNet synonyms — single-token only, excluding the word itself."""
     syns: List[str] = []
-    synsets = wn.synsets(clean, pos=wn_pos) if wn_pos else wn.synsets(clean)
-    for synset in synsets:
+    for synset in wn.synsets(strip_punctuation(word)):
         for lemma in synset.lemmas():
             cand = lemma.name().replace("_", " ")
             if cand.lower() != word.lower() and " " not in cand:
@@ -919,144 +876,109 @@ async def compute_trs_batch(prompt: str, words: List[str]) -> np.ndarray:
     return np.array(results, dtype=np.float32)
 
 
-def _action_from_triple(p_high: bool, c_high: bool, t_high: bool) -> str:
-    """ALSA Paper Table 1: map a (PLRS, CIIS, TRS) triple to an action."""
-    if p_high and c_high:                  return "Encrypt"
-    if p_high and not c_high and t_high:   return "Replace"
-    if p_high and not c_high:              return "Delete"
-    if not p_high and c_high:              return "Retain"
-    if not p_high and not c_high and t_high: return "Retain"
-    return "Delete"  # (L, L, L)
-
-
 def assign_actions_kmeans(
     plrs: np.ndarray,
     ciis: np.ndarray,
     trs: np.ndarray,
     pii_override: np.ndarray,
-    words: List[str],
-    spacy_nlp: spacy.Language,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Task 4.2 — Three-stage Action Assignment (ALSA Paper Table 1).
+    Task 4.2 — Two-stage Action Assignment (ALSA Paper Table 1).
 
-    STAGE 1 — PII Hard Override:
-        pii_override ≥ 0.9 → Encrypt.
+    STAGE 1 — PII Hard Override (before K-Means):
+        If a word matched a PII regex (pii_override ≥ 0.9) → force Encrypt.
+        This guarantees SSNs, emails, phone numbers are ALWAYS masked.
 
-    STAGE 1.5 — Function-Word Protection:
-        ADP/DET/CCONJ/SCONJ/PART/PUNCT with no PII → cap PLRS to
-        mean-0.01 so they always count as "low PLRS".
+    STAGE 2 — K-Means in [PLRS, CIIS, TRS] space:
+        For all remaining words, cluster and apply the FULL 8-case
+        decision table from ALSA Paper Table 1:
 
-    STAGE 2 — K-Means in [PLRS, CIIS, TRS] space.
-
-    STAGE 3 — Per-Word Sanity Check:
-        If the word's OWN triple disagrees with the cluster centroid's
-        action, override with the word's individual action. This
-        prevents cluster contamination on small prompts.
+        ┌──────┬──────┬──────┬──────────┐
+        │ PLRS │ CIIS │ TRS  │ Action   │
+        ├──────┼──────┼──────┼──────────┤
+        │ High │ High │ High │ Encrypt  │
+        │ High │ High │ Low  │ Encrypt  │
+        │ High │ Low  │ High │ Replace  │
+        │ High │ Low  │ Low  │ Delete   │
+        │ Low  │ High │ High │ Retain   │
+        │ Low  │ High │ Low  │ Retain   │
+        │ Low  │ Low  │ High │ Retain   │
+        │ Low  │ Low  │ Low  │ Delete   │
+        └──────┴──────┴──────┴──────────┘
 
     Returns:
-        cluster_ids, actions, pos_tags
+        cluster_ids : np.ndarray (n_words,)
+        actions     : np.ndarray (n_words, dtype=object)
     """
     n = len(plrs)
     actions     = np.empty(n, dtype=object)
     cluster_ids = np.zeros(n, dtype=int)
 
-    # ── Resolve SpaCy POS for each word ─────────────────────────────
-    doc = spacy_nlp(" ".join(words))
-    spacy_toks = [t for t in doc if not t.is_space]
-    pos_tags: List[str] = []
-    for w in words:
-        clean = strip_punctuation(w).lower()
-        matched_pos = "X"  # fallback
-        for st in spacy_toks:
-            if st.text.lower() == clean:
-                matched_pos = st.pos_
-                break
-        pos_tags.append(matched_pos)
-
-    # ── Stage 1: PII hard override ──────────────────────────────────
-    pii_mask = pii_override >= 0.9
+    # ── Stage 1: PII hard override ──────────────────────────────────────
+    pii_mask = pii_override >= 0.9  # regex-confirmed PII
     actions[pii_mask] = "Encrypt"
 
-    # ── Stage 1.5: Function-word protection ─────────────────────────
-    plrs = plrs.copy()  # don't mutate the caller's array
-    mean_plrs_raw = plrs.mean()
-    for i in range(n):
-        if pos_tags[i] in FUNCTION_WORD_POS and pii_override[i] < 0.9:
-            plrs[i] = min(plrs[i], mean_plrs_raw - 0.01)
-
-    # ── Stage 2: K-Means ────────────────────────────────────────────
+    # ── Stage 2: K-Means for the rest ──────────────────────────────────
     remaining_idx = np.where(~pii_mask)[0]
     if len(remaining_idx) == 0:
-        return cluster_ids, actions, pos_tags
+        return cluster_ids, actions
 
-    X = np.stack([plrs, ciis, trs], axis=1).astype(np.float64)
+    X = np.stack([plrs, ciis, trs], axis=1).astype(np.float64)  # (n, 3)
     k = min(KMEANS_N_CLUSTERS, len(remaining_idx), n)
     km = KMeans(n_clusters=k, n_init=15, random_state=42)
-    all_cluster_ids = km.fit_predict(X)
+    all_cluster_ids = km.fit_predict(X)   # fit on all n points for consistency
     cluster_ids[:] = all_cluster_ids
-    centroids = km.cluster_centers_
+    centroids = km.cluster_centers_       # (k, 3)
 
     mean_plrs = plrs.mean()
     mean_ciis = ciis.mean()
     mean_trs  = trs.mean()
 
-    # Cluster → action (centroid-based)
+    # Cluster → action mapping (ALSA Paper Table 1 — full 8-case table)
     cluster_action: Dict[int, str] = {}
     for c in range(k):
         cp, cc, ct = centroids[c]
-        cluster_action[c] = _action_from_triple(
-            cp > mean_plrs, cc > mean_ciis, ct > mean_trs
-        )
+        p_high = cp > mean_plrs
+        c_high = cc > mean_ciis
+        t_high = ct > mean_trs
 
-    # ── Stage 3: Per-word assignment with sanity check ──────────────
+        if p_high and c_high:                  # (H, H, *) → Encrypt
+            cluster_action[c] = "Encrypt"
+        elif p_high and not c_high and t_high: # (H, L, H) → Replace
+            cluster_action[c] = "Replace"
+        elif p_high and not c_high and not t_high:  # (H, L, L) → Delete
+            cluster_action[c] = "Delete"
+        elif not p_high and c_high:            # (L, H, *) → Retain
+            cluster_action[c] = "Retain"
+        elif not p_high and not c_high and t_high:  # (L, L, H) → Retain
+            cluster_action[c] = "Retain"
+        else:                                  # (L, L, L) → Delete
+            cluster_action[c] = "Delete"
+
     for i in remaining_idx:
-        cluster_act = cluster_action.get(int(cluster_ids[i]), "Retain")
+        actions[i] = cluster_action.get(int(cluster_ids[i]), "Retain")
 
-        # Per-word sanity check: does the word's own triple agree?
-        word_act = _action_from_triple(
-            plrs[i] > mean_plrs, ciis[i] > mean_ciis, trs[i] > mean_trs
-        )
-        if cluster_act != word_act:
-            log.debug(
-                "Sanity override [%d] '%s': cluster=%s → word=%s  "
-                "(P=%.3f C=%.3f T=%.3f)",
-                i, words[i], cluster_act, word_act,
-                plrs[i], ciis[i], trs[i],
-            )
-            actions[i] = word_act
-        else:
-            actions[i] = cluster_act
-
-    return cluster_ids, actions, pos_tags
+    return cluster_ids, actions
 
 
-def _build_masked_prompt(
-    words: List[str], actions: np.ndarray, pos_tags: List[str],
-) -> str:
+def _build_masked_prompt(words: List[str], actions: np.ndarray) -> str:
     """
     Build the intermediate masked version of the prompt.
-    Encrypt words become [MASK], Replace uses POS-aware WordNet synonyms,
+    Encrypt words become [MASK], Replace uses WordNet synonyms,
     Delete is omitted, Retain is kept verbatim.
-
-    Post-processing: collapse multiple spaces and fix leading/trailing
-    whitespace caused by consecutive Delete actions.
     """
     out: List[str] = []
-    for word, action, pos in zip(words, actions, pos_tags):
+    for word, action in zip(words, actions):
         if action == "Retain":
             out.append(word)
         elif action == "Delete":
             pass
         elif action == "Replace":
-            syns = get_wordnet_synonyms(word, n=3, pos_tag=pos)
+            syns = get_wordnet_synonyms(word, n=3)
             out.append(syns[0] if syns else word)
         elif action == "Encrypt":
             out.append(MASK_TOKEN)
-    result = " ".join(out)
-    # Collapse multiple spaces from consecutive deletes
-    result = re.sub(r'\s{2,}', ' ', result).strip()
-    return result
+    return " ".join(out)
 
 
 async def _generate_encrypt_candidates(
@@ -1080,10 +1002,7 @@ async def _generate_encrypt_candidates(
         f"Generate {n_candidates} different versions of this prompt where each [MASK] "
         f"is replaced with a FICTIONAL, NON-IDENTIFYING substitute. Rules:\n"
         f"- Names must be clearly fictional (e.g. 'Person A', 'Entity X')\n"
-        f"- For SSN-format placeholders, use ONLY literal text like "
-        f"'[REDACTED-SSN]' or 'XXX-XX-XXXX'. NEVER use digit sequences "
-        f"in NNN-NN-NNNN format (e.g. 123-45-6789 is FORBIDDEN)\n"
-        f"- Other numbers must be obviously fake (e.g. '[REDACTED]')\n"
+        f"- Numbers must be obviously fake placeholders (e.g. 'XXX-XX-XXXX')\n"
         f"- Medical/legal terms should be replaced with generic categories "
         f"(e.g. 'a medical condition', 'a medication')\n"
         f"- Preserve the sentence structure and grammatical correctness\n"
@@ -1172,7 +1091,6 @@ async def reconstruct_prompt_with_llm(
     words: List[str],
     actions: np.ndarray,
     original_prompt: str,
-    pos_tags: List[str],
 ) -> Tuple[str, str, List[str]]:
     """
     Task 4.3 — Apply per-word actions with LLM-powered Encrypt.
@@ -1189,7 +1107,7 @@ async def reconstruct_prompt_with_llm(
         masked_prompt    : str        — intermediate [MASK] version
         encrypt_candidates : List[str] — all candidates considered
     """
-    masked_prompt = _build_masked_prompt(words, actions, pos_tags)
+    masked_prompt = _build_masked_prompt(words, actions)
 
     # If no [MASK] tokens, no self-recommendation needed
     if MASK_TOKEN not in masked_prompt:
@@ -1256,14 +1174,12 @@ async def run_pipeline(prompt: str) -> Dict:
     log.info("TRS : %s", np.round(trs, 3))
 
     # ── Phase 4b: K-Means + actions ──────────────────────────────────────
-    cluster_ids, actions, pos_tags = assign_actions_kmeans(
-        plrs, ciis, trs, pii_override, words, registry.spacy_nlp,
-    )
+    cluster_ids, actions = assign_actions_kmeans(plrs, ciis, trs, pii_override)
     log.info("Actions: %s", actions)
 
     # ── Phase 4c: Reconstruct (with LLM self-recommendation for Encrypt) ──
     sanitised, masked_prompt, encrypt_candidates = await reconstruct_prompt_with_llm(
-        words, actions, prompt, pos_tags
+        words, actions, prompt
     )
     log.info("Masked:    %s", masked_prompt)
     log.info("Sanitised: %s", sanitised)
@@ -1570,78 +1486,6 @@ def generate_score_chart(result: Dict, test_idx: int) -> None:
     print(f"\n  {C.CYAN}📊 Chart saved → {out_path}{C.RESET}\n")
 
 
-def generate_3d_clustering_plot(result: Dict, test_idx: int) -> None:
-    """
-    Generate a 3D scatter plot of word clusters in (PLRS, CIIS, TRS) space.
-    Matches the ALSA paper aesthetic: white background, colored by cluster,
-    standard axes [0, 1].
-    """
-    _CHART_DIR.mkdir(parents=True, exist_ok=True)
-
-    plrs = np.array(result["plrs"])
-    ciis = np.array(result["ciis"])
-    trs  = np.array(result["trs"])
-    cluster_ids = np.array(result["cluster_ids"])
-
-    fig = plt.figure(figsize=(10, 9))
-    ax = fig.add_subplot(111, projection='3d')
-    fig.patch.set_facecolor('white')
-    ax.set_facecolor('white')
-
-    # Color palette as requested: Red, Green, Blue, Purple, Orange, Cyan, Yellow, Pink
-    palette = [
-        '#ff0000', '#00aa00', '#0000ff', '#800080', 
-        '#ffa500', '#00ffff', '#ffff00', '#ffc0cb'
-    ]
-
-    for cid in range(KMEANS_N_CLUSTERS):
-        mask = (cluster_ids == cid)
-        if not np.any(mask):
-            continue
-        
-        ax.scatter(
-            plrs[mask], ciis[mask], trs[mask],
-            c=palette[cid % len(palette)],
-            label=f"Cluster {cid + 1}",
-            s=55, alpha=0.75, edgecolors='none'
-        )
-
-    # Styling labels to match the academic look
-    ax.set_xlabel('PLRS', fontweight='bold', fontsize=14, labelpad=12)
-    ax.set_ylabel('CIIS', fontweight='bold', fontsize=14, labelpad=12)
-    ax.set_zlabel('TRS',  fontweight='bold', fontsize=14, labelpad=12)
-
-    ax.set_xlim(0, 1.0)
-    ax.set_ylim(0, 1.0)
-    ax.set_zlim(0, 1.0)
-
-    # Academic grid lines (grey/dashed)
-    ax.xaxis._axinfo["grid"].update({"color": "#dddddd", "linestyle": "--"})
-    ax.yaxis._axinfo["grid"].update({"color": "#dddddd", "linestyle": "--"})
-    ax.zaxis._axinfo["grid"].update({"color": "#dddddd", "linestyle": "--"})
-
-    plt.title(
-        "Clustering Tendency Analysis of the Triplets\n"
-        "(PLRS, CIIS, TRS) for Each Word",
-        fontweight='bold', fontsize=17, pad=25
-    )
-    
-    # Legend in upper-left corner
-    ax.legend(
-        loc='upper left', fontsize=10, framealpha=0.6, 
-        facecolor='white', edgecolor='#cccccc', borderpad=0.8
-    )
-
-    # Subtitle for test case
-    fig.text(0.5, 0.04, f"Figure 2: Test {test_idx} Patterns", ha='center', fontsize=12, style='italic')
-
-    out_path = _CHART_DIR / f"test_{test_idx:02d}_clustering_3d.png"
-    plt.savefig(out_path, dpi=180, bbox_inches='tight')
-    plt.close(fig)
-    log.info("3D Cluster chart saved → %s", out_path)
-    print(f"  {C.CYAN}📈 3D Clustering plot saved → {out_path}{C.RESET}")
-
-
 async def run_tests() -> None:
     print("\n")
     _sep()
@@ -1682,7 +1526,6 @@ async def run_tests() -> None:
               f"(★ = PII regex hard-override)")
         _print_table(result)
         generate_score_chart(result, idx)
-        generate_3d_clustering_plot(result, idx)
 
         print()
         print(f"  Legend: {C.GREEN}■ Retain{C.RESET}  {C.RED}■ Delete{C.RESET}"
