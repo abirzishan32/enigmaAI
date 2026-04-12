@@ -1,5 +1,3 @@
-
-
 # ── Standard Library ─────────────────────────────────────────────────────────
 import asyncio
 import json
@@ -30,10 +28,9 @@ import spacy
 import nltk
 from nltk.corpus import wordnet as wn
 
+from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics.pairwise import rbf_kernel
-
-from scipy.spatial.distance import mahalanobis
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -56,20 +53,15 @@ N_COMMON_WORDS    = 10_000
 MAX_BERT_TOKENS   = 512
 MASK_TOKEN        = "[MASK]"
 
-# Absolute high/low thresholds used by ALSA Table-1 action rules.
-PLRS_HIGH_THRESHOLD = 0.55
-CIIS_HIGH_THRESHOLD = 0.55
-TRS_HIGH_THRESHOLD  = 0.55
+# ALSA contextual coherence controls (paper-faithful defaults).
+ALSA_COHERENCE_ALPHA = 0.8
+ALSA_POSITION_BETA = 0.5
+ALSA_COHERENCE_EPS = 1e-9
 
-# Exposure risk is calibrated against fixed NLL bounds (absolute scale),
-# not re-normalised within each prompt.
-EXPOSURE_RISK_MIN_NLL = 2.0
-EXPOSURE_RISK_MAX_NLL = 12.0
-
-# NER contributions are intentionally soft so they cannot dominate PLRS.
-NER_ENTITY_BOOST = 0.25
-NER_PROPN_BOOST  = 0.15
-NER_FUSION_WEIGHT = 0.20
+# Function words are down-weighted in pairwise coherence interactions.
+FUNCTION_POS_TAGS = {
+    "ADP", "DET", "CCONJ", "SCONJ", "PART", "PRON", "AUX", "PUNCT", "SYM"
+}
 
 # Replace-action quality controls.
 REPLACE_MIN_FREQUENCY = 2
@@ -84,8 +76,8 @@ TRS_MAX_TOKENS            = 16          # response is a single float
 
 # Encrypt self-recommendation weights:
 #   Score(P'_i) = α·Fluency + β·Coherence + γ·TaskConsistency
-ENCRYPT_NUM_CANDIDATES    = 3           # m candidate completions
-ENCRYPT_CANDIDATE_TOKENS  = 256         # max tokens for candidate generation
+ENCRYPT_NUM_CANDIDATES    = 3           # m candidate completions (Appendix A)
+ENCRYPT_CANDIDATE_TOKENS  = 500         # max_new_tokens per paper experiment setup (§4)
 ENCRYPT_ALPHA             = 0.33        # fluency weight
 ENCRYPT_BETA              = 0.33        # coherence weight
 ENCRYPT_GAMMA             = 0.34        # task-consistency weight
@@ -112,12 +104,6 @@ PII_PATTERNS: List[Tuple[re.Pattern, float]] = [
     (re.compile(r'\$\s*\d[\d,]*(?:\.\d{2})?\b'),               0.75), # Dollar amounts
     (re.compile(r'\b\d+\s*(?:million|billion|thousand)\b', re.I), 0.70), # Large sums
 ]
-
-# SpaCy NER labels that indicate high-sensitivity named entities.
-# ONLY truly identifying labels — CARDINAL/DATE/TIME/PERCENT/QUANTITY
-# are excluded because they tag non-identifying values (ages, stages,
-# percentages) that should NOT be auto-escalated.
-SENSITIVE_NER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "MONEY"}
 
 # spaCy POS to WordNet POS mapping for POS-safe synonym retrieval.
 _SPACY_TO_WN_POS: Dict[str, str] = {
@@ -176,12 +162,7 @@ def load_gpt2(device: torch.device):
 
 
 def load_llama():
-    """
-    Load Llama-3-8B-Instruct-4bit via mlx-lm (Apple Silicon only).
 
-    Uses the mlx-community pre-quantised model optimised for Apple's
-    Metal GPU via the MLX framework.  Requires ~5–6 GB unified memory.
-    """
     from mlx_lm import load as mlx_load
     log.info("Loading Llama-3 backbone (%s) …", LLAMA_MODEL_NAME)
     model, tokenizer = mlx_load(LLAMA_MODEL_NAME)
@@ -189,37 +170,42 @@ def load_llama():
     return model, tokenizer
 
 
-def _llama_generate(prompt_text: str, max_tokens: int = 16) -> str:
+def _llama_generate(
+    prompt_text: str,
+    max_tokens: int = 16,
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    top_k: int = 0,
+) -> str:
     """
-    Synchronous single-call Llama-3 generation via mlx-lm.
+    Single-call Llama-3 inference via mlx_lm ≥ 0.31.
 
-    Applies the Llama-3 Instruct chat template for proper formatting,
-    then generates up to *max_tokens* of output.
+    mlx_lm 0.31+ removed the old temp/top_p kwargs from generate_step.
+    Temperature and nucleus/top-k sampling are now configured through a
+    sampler callable produced by make_sampler().
 
-    This function is SYNCHRONOUS and runs on the MLX Metal backend.
-    It should be called from async code via ``run_in_executor``.
+    Args:
+        temp  : Sampling temperature.  0.0 → greedy (default for TRS).
+        top_p : Top-p nucleus threshold.  0.0 → disabled.
+        top_k : Top-k threshold.  0 → disabled.
     """
     from mlx_lm import generate as mlx_generate
+    from mlx_lm.sample_utils import make_sampler
+
     messages = [{"role": "user", "content": prompt_text}]
     formatted = registry.llama_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+    sampler = make_sampler(temp=temp, top_p=top_p, top_k=top_k)
     return mlx_generate(
         registry.llama_model, registry.llama_tokenizer,
         prompt=formatted, max_tokens=max_tokens, verbose=False,
+        sampler=sampler,
     )
 
 
 def _build_bert_common_vectors(tokenizer, model, device) -> torch.Tensor:
-    """
-    Offline: embed N_COMMON_WORDS from the Brown corpus in ISOLATION
-    (single word → [CLS] vector). This is the 'normal' reference
-    distribution for the Isolation Forest.
 
-    CRITICAL: words are embedded one-at-a-time (no context), so the
-    Isolation Forest sees the same kind of vector as prompt words will
-    be scored with (isolated embeddings, not contextual).
-    """
     from nltk.corpus import brown
     nltk.download("brown", quiet=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -289,24 +275,12 @@ app = FastAPI(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def strip_punctuation(word: str) -> str:
-    """
-    Remove leading/trailing punctuation from a surface token so BERT and
-    GPT-2 receive clean lexical forms.
 
-    E.g.  "Smith,"  →  "Smith"
-          "8765."   →  "8765"
-          "'hello'" →  "hello"
-
-    We keep internal punctuation (hyphens in "432-91-8765") intact.
-    """
     return re.sub(r'^[^\w]+|[^\w]+$', '', word) or word
 
 
 def get_word_char_spans(words: List[str], text: str) -> List[Tuple[int, int]]:
-    """
-    Return (start, end) character indices for each surface word within `text`.
-    Uses a running cursor so repeated words are correctly disambiguated.
-    """
+
     spans: List[Tuple[int, int]] = []
     cursor = 0
     for w in words:
@@ -381,35 +355,13 @@ def _get_word_pos_tags(words: List[str], prompt: str, spacy_nlp: spacy.Language)
 
 
 def _robust_scale_1d(arr: np.ndarray) -> np.ndarray:
-    """
-    Percentile-clipped Min-Max normalisation.
 
-    Pure min-max is fragile: a single outlier (or an all-identical array)
-    collapses everything to 0. We clip to [p5, p95] first to remove
-    extreme outliers, then scale to [0, 1].
-
-    For small arrays (< 10 elements) percentile clipping is skipped to
-    avoid distorting results.
-    """
     if len(arr) >= 10:
         lo  = float(np.percentile(arr, 5))
         hi  = float(np.percentile(arr, 95))
         arr = np.clip(arr, lo, hi)
     lo, hi = arr.min(), arr.max()
     return ((arr - lo) / (hi - lo + 1e-9)).astype(np.float32)
-
-
-def _fixed_range_scale_1d(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """
-    Absolute scaling to [0, 1] using a fixed numeric range.
-
-    This avoids context-relative behaviour where each prompt is always
-    stretched to the full range regardless of absolute magnitude.
-    """
-    if hi <= lo:
-        raise ValueError("Invalid fixed scaling range: hi must be > lo")
-    scaled = (arr - lo) / (hi - lo)
-    return np.clip(scaled, 0.0, 1.0).astype(np.float32)
 
 
 # ── BERT embedding helpers ────────────────────────────────────────────────────
@@ -440,16 +392,7 @@ def embed_words_isolated_bert(
     model: AutoModel,
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Embed each word IN ISOLATION (no surrounding context) using [CLS].
 
-    WHY: The BERT common-word reference corpus was built the same way
-    (each word alone). Using contextual embeddings here would compare
-    apples to oranges in the Isolation Forest, because the reference
-    distribution is context-free.
-
-    Returns shape (n_words, 768).
-    """
     clean_words = [strip_punctuation(w) for w in words]
     return embed_sentences_bert(clean_words, tokenizer, model, device)
 
@@ -462,17 +405,7 @@ def embed_words_in_context_bert(
     model: AutoModel,
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Embed words using their CONTEXTUAL BERT representation.
-
-    FIX over v1:
-    - Use offset_mapping to find which sub-tokens correspond to which
-      surface word by CHARACTER OVERLAP, not greedy string matching.
-    - Average ALL sub-tokens that belong to the word (not just the first).
-    - Fall back to [CLS] only when no sub-token overlaps (very rare).
-
-    Returns shape (n_words, 768).
-    """
+  
     # Remove offset_mapping from inputs before passing to model
     enc_raw = tokenizer(
         prompt, return_tensors="pt",
@@ -508,18 +441,7 @@ def embed_words_in_context_bert(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_pii_override_scores(words: List[str], prompt: str) -> np.ndarray:
-    """
-    Hard PII detection layer using regex + SpaCy NER.
-
-    This runs BEFORE the statistical pipeline and produces a per-word
-    override score.  Words matched by PII patterns receive a score ≥ 0.7;
-    unmatched words receive 0.0 and proceed normally.
-
-    The override score is later MAX-merged with the statistical PLRS so
-    PII can never be silently under-scored.
-
-    Returns: np.ndarray (n_words,) in [0, 1]
-    """
+   
     override = np.zeros(len(words), dtype=np.float32)
     word_spans = get_word_char_spans(words, prompt)
 
@@ -535,100 +457,43 @@ def compute_pii_override_scores(words: List[str], prompt: str) -> np.ndarray:
     return override
 
 
-def compute_ner_sensitivity_boost(
-    words: List[str],
-    prompt: str,
-    spacy_nlp: spacy.Language,
-) -> np.ndarray:
-    """
-    SpaCy Named Entity Recognition (NER) boost.
-
-    Proper nouns and named entities (PERSON, ORG, GPE, MONEY) are
-    inherently sensitive even when they don't match a rigid regex.
-    E.g. "John Smith" will be tagged PERSON by SpaCy.
-
-    Returns a boost array (n_words,) in [0, 1]:
-        SENSITIVE_NER_LABELS  → 0.25 boost
-        PROPN (proper noun)   → 0.15 boost
-        Others                → 0.0
-
-    NOTE: The boost is used ADDITIVELY (not as an override) when fused
-    into PLRS. This preserves the statistical signal from the Isolation
-    Forest and Exposure Risk components.
-    """
-    doc = spacy_nlp(prompt)
-    word_spans = get_word_char_spans(words, prompt)
-    boost = np.zeros(len(words), dtype=np.float32)
-
-    # ── NER entity labels ────────────────────────────────────────────────
-    for ent in doc.ents:
-        if ent.label_ in SENSITIVE_NER_LABELS:
-            for i, (ws, we) in enumerate(word_spans):
-                if ws < ent.end_char and we > ent.start_char:
-                    boost[i] = max(boost[i], NER_ENTITY_BOOST)
-
-    # ── PROPN (proper noun) — catches names SpaCy didn't tag as entities ─
-    for tok in doc:
-        if tok.pos_ == "PROPN" and not tok.is_space:
-            for i, w in enumerate(words):
-                if tok.text.lower() == strip_punctuation(w).lower():
-                    boost[i] = max(boost[i], NER_PROPN_BOOST)
-
-    return boost
-
-
 def compute_intrinsic_sensitivity(
     prompt_word_vecs_isolated: np.ndarray,
     common_vecs: np.ndarray,
 ) -> np.ndarray:
     """
-    Task 2.1 — Intrinsic Sensitivity via Isolation Forest.
+    Paper §3.3.1 + Eq. 1–2.
 
-    Fit the forest ONLY on the common-word reference distribution,
-    then SCORE the prompt words as unseen test points.
+    Isolation Forest is fit on the common-word reference distribution;
+    each prompt word is scored as an outlier in that space.
 
-    CALIBRATION FIX (Bug 6):
-    Instead of normalising anomaly scores within the prompt (which
-    makes the least-common common word score 1.0 regardless of
-    actual sensitivity), we calibrate against the reference
-    distribution itself:
+        OS(w_i)  = 2^(-E[depth(w_i)] / c(n))   ≈ -score_samples()
+        IS(w_i)  = (OS(w_i) - min_{v∈V*} OS(v))
+                 / (max_{v∈V*} OS(v) - min_{v∈V*} OS(v))   [Eq. 2]
 
-        IS(w_i) = percentile_rank(score(w_i), ref_scores)
+    where V* is the set of words in the input prompt (normalised over
+    prompt words only, exactly as stated in the paper).
 
-    This gives each prompt word its true anomaly percentile relative
-    to ordinary English. Common words like "quick" get ~0.15, while
-    genuinely rare words like "adenocarcinoma" get ~0.95.
-
-    Uses contamination='auto' for a theoretically sound decision
-    boundary instead of an arbitrary 5% contamination rate.
-
-    Args:
-        prompt_word_vecs_isolated : np.ndarray (n_words, 768)
-        common_vecs : np.ndarray (N_COMMON, 768)
-
-    Returns: np.ndarray (n_words,) in [0, 1]
+    Paper hyperparameter: T = 8 decision trees (experiment section:
+    "we employ eight decision trees").
     """
     iso = IsolationForest(
-        n_estimators=200,
-        contamination="auto",   # theoretically sound decision boundary
+        n_estimators=8,          # T=8 as per paper experiment setup
+        contamination="auto",
         random_state=42,
         n_jobs=-1,
     )
     iso.fit(common_vecs)                        # FIT on reference only
 
-    # Score prompt words (lower = more anomalous → flip sign)
-    prompt_scores = -iso.score_samples(prompt_word_vecs_isolated)
+    # OS(w_i): higher = more anomalous (rare/out-of-distribution)
+    prompt_os = -iso.score_samples(prompt_word_vecs_isolated)
 
-    # Score a reference sample for calibration (subsample for speed)
-    ref_sample = common_vecs[:2000]
-    ref_scores = -iso.score_samples(ref_sample)
-
-    # Percentile rank: fraction of reference words less anomalous
-    anomaly = np.array(
-        [float(np.mean(ref_scores < ps)) for ps in prompt_scores],
-        dtype=np.float32,
-    )
-    return anomaly  # already in [0, 1] — no _robust_scale_1d needed
+    # Eq. 2: min-max normalisation over V* (prompt words only)
+    lo = float(np.min(prompt_os))
+    hi = float(np.max(prompt_os))
+    if hi - lo < 1e-9:
+        return np.full(len(prompt_os), 0.5, dtype=np.float32)
+    return ((prompt_os - lo) / (hi - lo)).astype(np.float32)
 
 
 @torch.no_grad()
@@ -639,34 +504,7 @@ def compute_exposure_risk(
     model: AutoModelForCausalLM,
     device: torch.device,
 ) -> np.ndarray:
-    """
-    Task 2.2 — Exposure Risk via GPT-2 Negative Log-Likelihood (FIXED).
 
-    FIX: Replace fragile greedy string-reconstruction with OFFSET MAPPING.
-
-    The tokenizer returns (char_start, char_end) for every BPE token.
-    We group tokens by which surface word's character span they fall in,
-    then average the NLL values within each group.
-
-    This correctly handles:
-        • Hyphenated tokens:  "432-91-8765"  (multiple BPE tokens)
-        • Punctuation:        "Smith,"        (BPE splits at comma)
-        • Contractions:       "don't"         (split at apostrophe)
-
-    NLL formula:
-        NLL_t = -log₂ P(w_t | w_1 … w_{t-1})
-
-    The first token has no preceding context, so we skip it (its NLL
-    is undefined in a purely auto-regressive sense). Instead, words
-    whose first BPE token is at position 0 receive the mean NLL.
-
-    Returns: np.ndarray (n_words,) in [0, 1]
-
-    IMPORTANT:
-    Exposure scores are mapped with FIXED NLL bounds to preserve an
-    absolute interpretation across prompts. This avoids the bug where
-    per-prompt min-max scaling makes one word hit 1.0 by construction.
-    """
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -682,8 +520,7 @@ def compute_exposure_risk(
     out = model(**enc)
     logits = out.logits[0]  # (seq_len, vocab_size)
 
-    # Shift: logits[t] predicts the probability distribution for token[t+1]
-    # So nll_tokens[t] = NLL of input_ids[t+1] given all prior tokens
+
     shift_logits = logits[:-1]                              # (seq_len-1, vocab)
     shift_ids    = input_ids[0, 1:]                         # (seq_len-1,)
     probs        = F.softmax(shift_logits, dim=-1)          # (seq_len-1, vocab)
@@ -692,16 +529,10 @@ def compute_exposure_risk(
 
     mean_nll = float(nll_tokens.mean()) if len(nll_tokens) else 5.0
 
-    # ── Map BPE tokens → surface words via character overlap ─────────────
-    # offsets[t] = (char_start, char_end) of token t in the original string.
-    # nll_tokens[t] = NLL of token t+1, so token t+1 corresponds to
-    # offset_mapping[t+1].  We iterate t from 1 (the second token onward)
-    # since we have NLL values for tokens[1..seq_len-1].
+
     word_spans = get_word_char_spans(words, prompt)
 
-    # Build a list: for each token index t (1-indexed), its NLL
-    # nll_tokens has len = seq_len - 1.  nll_tokens[i] is NLL of token[i+1].
-    # So token at offset_mapping index `j` has NLL = nll_tokens[j-1].
+
     token_nll_map: List[Optional[float]] = [None] * len(offsets)
     for j in range(1, len(offsets)):  # skip token 0 (no prior context)
         nll_idx = j - 1
@@ -718,13 +549,15 @@ def compute_exposure_risk(
                 nll_val = token_nll_map[j]
                 if nll_val is not None:
                     tok_nlls.append(nll_val)
-        word_nlls.append(float(np.mean(tok_nlls)) if tok_nlls else mean_nll)
+        # Paper Eq. 3: NLL_wi = Σ_{j∈S_wi} nll_tj  (SUM, not mean)
+        word_nlls.append(float(np.sum(tok_nlls)) if tok_nlls else mean_nll)
 
-    return _fixed_range_scale_1d(
-        np.array(word_nlls, dtype=np.float32),
-        EXPOSURE_RISK_MIN_NLL,
-        EXPOSURE_RISK_MAX_NLL,
-    )
+    nll_arr = np.array(word_nlls, dtype=np.float32)
+    lo = float(np.min(nll_arr)) if nll_arr.size else 0.0
+    hi = float(np.max(nll_arr)) if nll_arr.size else 1.0
+    if hi - lo < 1e-9:
+        return np.full_like(nll_arr, 0.5, dtype=np.float32)
+    return ((nll_arr - lo) / (hi - lo + 1e-9)).astype(np.float32)
 
 
 def compute_plrs(
@@ -732,45 +565,30 @@ def compute_plrs(
     common_vecs: np.ndarray,
     prompt: str,
     words: List[str],
-    spacy_nlp: spacy.Language,
     gpt2_tokenizer: AutoTokenizer,
     gpt2_model: AutoModelForCausalLM,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Task 2.3 — Final PLRS for each word (FIXED).
+    Paper §3.3 + Eq. 5: PLRS(w_i) = IS(w_i) × E(w_i)
 
-    FIXED FORMULA: Weighted-additive fusion instead of multiplicative.
+    IS — Intrinsic Sensitivity (Isolation Forest on Wikipedia frequency
+         space, §3.3.1 / Eq. 1–2)
+    E  — Exposure Risk (autoregressive token-level NLL, §3.3.2 / Eq. 3–4)
 
-        PLRS_raw_i = 0.5 × Intrinsic_i + 0.5 × Exposure_i
-
-    Then merged with PII/NER signals:
-
-        PLRS_i = max( PLRS_raw_i + λ·NER_boost_i, PII_override_i )
-
-    where λ = NER_FUSION_WEIGHT (soft additive contribution).
-
-    WHY additive? The multiplicative formula `A × B` collapses to 0 if
-    either A or B is 0 (which happens after min-max normalisation when
-    one metric has very low variance). Additive fusion preserves signal
-    from either component independently.
-
-    Returns:
-        plrs          : np.ndarray (n_words,) in [0, 1]
-        pii_override  : np.ndarray (n_words,) in [0, 1]  (for hard overrides)
+    pii_override is computed separately and returned so that
+    assign_actions_kmeans can hard-force Encrypt on regex-confirmed PII
+    (action-assignment stage, not part of the PLRS score itself).
     """
     intrinsic = compute_intrinsic_sensitivity(prompt_word_vecs_isolated, common_vecs)
     exposure  = compute_exposure_risk(prompt, words, gpt2_tokenizer, gpt2_model, device)
 
-    plrs_raw = 0.5 * intrinsic + 0.5 * exposure  # additive fusion
+    # Eq. 5: PLRS(w_i) = IS(w_i) × E(w_i)
+    plrs = (intrinsic * exposure).astype(np.float32)
 
+    # Regex-confirmed PII override — used only in action assignment, not
+    # folded into PLRS so the score stays faithful to the paper formula.
     pii_override = compute_pii_override_scores(words, prompt)
-    ner_boost    = compute_ner_sensitivity_boost(words, prompt, spacy_nlp)
-
-    # NER boost is soft-additive, never a hard override.
-    # PII regex patterns always override (hard-confirmed identifiers).
-    plrs = np.clip(plrs_raw + NER_FUSION_WEIGHT * ner_boost, 0.0, 1.0)
-    plrs = np.maximum(plrs, pii_override).astype(np.float32)
 
     return plrs, pii_override
 
@@ -786,47 +604,64 @@ def compute_contextual_coherence(
     bert_word_vecs: np.ndarray,
 ) -> np.ndarray:
     """
-    Task 3.1 — Contextual Coherence via Mahalanobis distance.
+    Paper §3.4.2 + Eq. 8–10.
 
-    A word that is semantically DISTANT from the POS-weighted centroid
-    of the sentence carries unique, non-redundant meaning — deleting it
-    would structurally damage the sentence.
+    For each pair (i, j):
 
-    Mahalanobis:  d_M(x, μ) = √[(x−μ)ᵀ · Σ⁻¹ · (x−μ)]
+        T_ij   = sqrt((v_i - v_j)^T Q_ij (v_i - v_j))       [Eq. 8]
+        Q_ij   = I + α * D_ij,   D_ij = d_ij * I,  d_ij = ρ_i * ρ_j
+        R_ij   = |q_i - q_j|                                  [Eq. 9]
+        r*_ij  = β * R_ij + T_ij
+        CC(w_i) = 1 / Σ_{j≠i} (r*_ij + ε)                   [Eq. 10]
 
-    We regularise Σ with λI (λ=0.1) to handle the n << p case
-    (sentence length << 768 BERT dimensions).
+    where ρ = 1.0 for content words, 0.3 for function words (Appendix C).
+
+    The paper formula is the INVERSE OF THE SUM of distances, not the
+    sum/mean of inverse distances.  A word far from even one other word
+    gets a large denominator → small CC (not well-integrated contextually).
+
+    Returns a robustly scaled coherence vector in [0, 1].
     """
-    doc = spacy_nlp(prompt)
-    spacy_toks = [t for t in doc if not t.is_space]
+    n = len(words)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    if n == 1:
+        return np.array([0.5], dtype=np.float32)
 
-    pos_weights = np.ones(len(words), dtype=np.float32)
-    for i, w in enumerate(words):
-        clean = strip_punctuation(w).lower()
-        for st in spacy_toks:
-            if st.text.lower() == clean:
-                pos_weights[i] = POS_WEIGHT.get(st.pos_, 0.5)
-                break
+    pos_tags = _get_word_pos_tags(words, prompt, spacy_nlp)
 
-    V   = bert_word_vecs                               # (n, 768)
-    w_col = pos_weights.reshape(-1, 1)                 # (n, 1)
-    centroid = (w_col * V).sum(0) / (w_col.sum() + 1e-9)  # (768,)
-
-    if V.shape[0] > 1:
-        cov     = np.cov(V.T)                          # (768, 768)
-        cov_reg = cov + 0.1 * np.eye(cov.shape[0])    # regularise
-        try:
-            cov_inv = np.linalg.inv(cov_reg)
-        except np.linalg.LinAlgError:
-            cov_inv = np.eye(cov_reg.shape[0])
-    else:
-        cov_inv = np.eye(V.shape[1])
-
-    distances = np.array(
-        [mahalanobis(V[i], centroid, cov_inv) for i in range(len(words))],
-        dtype=np.float32,
+    # ρ = 1.0 for content words, 0.3 for function words (Appendix C, Table 6)
+    rho = np.array(
+        [0.3 if p in FUNCTION_POS_TAGS else 1.0 for p in pos_tags],
+        dtype=np.float64,
     )
-    return _robust_scale_1d(distances)
+
+    V = np.asarray(bert_word_vecs, dtype=np.float64)
+    dim = V.shape[1]
+    cc = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        dist_sum = 0.0                       # Σ_{j≠i} (r*_ij + ε)
+        for j in range(n):
+            if i == j:
+                continue
+
+            delta = V[i] - V[j]
+            d_ij = float(rho[i] * rho[j])
+
+            # Q_ij = I + α * D_ij; diagonal entries = (1 + α * d_ij)
+            q_diag = np.full(dim, 1.0 + ALSA_COHERENCE_ALPHA * d_ij, dtype=np.float64)
+            quadratic = float(np.sum((delta * delta) * q_diag))
+            t_ij = float(np.sqrt(max(quadratic, 0.0)))
+
+            r_ij = float(abs(i - j))         # positional distance [Eq. 9]
+            r_star = ALSA_POSITION_BETA * r_ij + t_ij
+            dist_sum += r_star + ALSA_COHERENCE_EPS
+
+        # Eq. 10: CC(w_i) = 1 / Σ_{j≠i}(r*_ij + ε)
+        cc[i] = 1.0 / dist_sum if dist_sum > 0.0 else 0.0
+
+    return _robust_scale_1d(cc.astype(np.float32))
 
 
 def get_wordnet_synonyms(word: str, n: int = 5) -> List[str]:
@@ -1025,43 +860,59 @@ def compute_semantic_distinctiveness(
     device: torch.device,
 ) -> np.ndarray:
     """
-    Task 3.2 — Semantic Distinctiveness via Maximum Mean Discrepancy (MMD).
+    Paper §3.4.1 + Eq. 6–7.
 
-    If swapping a word with synonyms drastically shifts the sentence's [CLS]
-    embedding, that word is semantically critical.
+    For each word w_i, construct S_{w_i→w'} by replacing only the token at
+    position i (positional substitution, not global string replace).
 
-    MMD² = k(X,X) − 2·k(X,Y) + k(Y,Y)    where k = RBF kernel.
+        Δ(S, S_{w_i→w'}) = MMD(Φ(S), Φ(S_{w_i→w'}))          [Eq. 6]
+        SD(w_i) = (1/|C(w_i)|) Σ_{w'∈C} Δ(S, S_{w_i→w'})     [Eq. 7]
 
-    Words with no synonyms receive distinctiveness = 0.5 (moderate).
-    Using 1.0 would over-inflate CIIS for technical terms (e.g.
-    "backpropagation", "adenocarcinoma") that have no WordNet entries,
-    causing them to be over-encrypted instead of retained.
+    For a SINGLE-SAMPLE MMD (one embedding per sentence):
+        k(x,x) = 1  and  k(y,y) = 1  (RBF self-kernel)
+        MMD²(x, y) = k(x,x) − 2·k(x,y) + k(y,y) = 2(1 − k(x,y))
+
+    This means each Δ is computed INDEPENDENTLY per synonym, then averaged.
+    The previous implementation computed one MMD between the original and
+    the entire synonym set, which introduced cross-synonym kYY terms not
+    present in the paper and therefore produced systematically different
+    (lower) SD scores for words with many synonyms.
+
+    BERT sentence embeddings are batched across all synonyms for efficiency;
+    only the final aggregation changes.
+
+    Words with no WordNet synonyms receive SD = 0.5 (moderate default).
     """
     orig_cls = embed_sentences_bert([prompt], bert_tokenizer, bert_model, device)  # (1, 768)
-    gamma    = 1.0 / orig_cls.shape[1]   # γ = 1/768
+    orig_np  = orig_cls.numpy()
+    gamma    = 1.0 / orig_cls.shape[1]   # γ = 1/d  (d = 768)
 
     mmd_scores: List[float] = []
-    for word in words:
+    for word_idx, word in enumerate(words):
         synonyms = get_wordnet_synonyms(word, n=5)
         if not synonyms:
             mmd_scores.append(0.5)   # moderate: irreplaceable ≠ sensitive
             continue
 
-        mutants = []
-        clean_w = strip_punctuation(word)
+        # Build one S_{w_i→w'} per synonym (positional substitution only)
+        mutants: List[str] = []
         for syn in synonyms:
-            mutant = re.sub(r'\b' + re.escape(clean_w) + r'\b', syn,
-                            prompt, flags=re.IGNORECASE)
-            mutants.append(mutant)
+            words_copy = words.copy()
+            words_copy[word_idx] = _apply_surface_form(word, syn)
+            mutants.append(" ".join(words_copy))
 
+        # Batch-encode all synonym sentences in one BERT forward pass
         mutant_cls = embed_sentences_bert(mutants, bert_tokenizer, bert_model, device)
+        mutant_np  = mutant_cls.numpy()  # (|C|, 768)
 
-        kXX = float(rbf_kernel(orig_cls.numpy(),   orig_cls.numpy(),   gamma=gamma).mean())
-        kXY = float(rbf_kernel(orig_cls.numpy(),   mutant_cls.numpy(), gamma=gamma).mean())
-        kYY = float(rbf_kernel(mutant_cls.numpy(), mutant_cls.numpy(), gamma=gamma).mean())
+        # Eq. 6: Δ(S, S_{w→w'}) = MMD²(orig, syn_i) = 2(1 − k(orig, syn_i))
+        # Eq. 7: SD = mean over individual per-synonym MMD² values
+        individual_mmds: List[float] = []
+        for i in range(len(synonyms)):
+            k_xy = float(rbf_kernel(orig_np, mutant_np[[i]], gamma=gamma)[0][0])
+            individual_mmds.append(max(2.0 * (1.0 - k_xy), 0.0))
 
-        mmd2 = kXX - 2 * kXY + kYY
-        mmd_scores.append(max(mmd2, 0.0))
+        mmd_scores.append(float(np.mean(individual_mmds)))
 
     return _robust_scale_1d(np.array(mmd_scores, dtype=np.float32))
 
@@ -1169,82 +1020,58 @@ def assign_actions_kmeans(
     trs: np.ndarray,
     pii_override: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Task 4.2 — Deterministic Action Assignment (ALSA Paper Table 1).
 
-    STAGE 1 — PII Hard Override (before table rules):
-        If a word matched a PII regex (pii_override ≥ 0.9) → force Encrypt.
-        This guarantees SSNs, emails, phone numbers are ALWAYS masked.
-
-    STAGE 2 — Per-word Table Rule:
-        For all remaining words, apply the FULL 8-case decision table
-        directly using fixed high/low thresholds.
-
-        ┌──────┬──────┬──────┬──────────┐
-        │ PLRS │ CIIS │ TRS  │ Action   │
-        ├──────┼──────┼──────┼──────────┤
-        │ High │ High │ High │ Encrypt  │
-        │ High │ High │ Low  │ Encrypt  │
-        │ High │ Low  │ High │ Replace  │
-        │ High │ Low  │ Low  │ Delete   │
-        │ Low  │ High │ High │ Retain   │
-        │ Low  │ High │ Low  │ Retain   │
-        │ Low  │ Low  │ High │ Retain   │
-        │ Low  │ Low  │ Low  │ Delete   │
-        └──────┴──────┴──────┴──────────┘
-
-    Returns:
-        cluster_ids : np.ndarray (n_words,) where each id encodes
-                      (PLRS_high, CIIS_high, TRS_high) as a 3-bit value.
-        actions     : np.ndarray (n_words, dtype=object)
-    """
     n = len(plrs)
     actions     = np.empty(n, dtype=object)
-    cluster_ids = np.zeros(n, dtype=int)
+    cluster_ids = np.full(n, -1, dtype=int)
 
-    # ── Stage 1: PII hard override ──────────────────────────────────────
-    pii_mask = pii_override >= 0.9  # regex-confirmed PII
-    actions[pii_mask] = "Encrypt"
-
-    # ── Stage 2: Direct ALSA table mapping for the rest ────────────────
-    remaining_idx = np.where(~pii_mask)[0]
-    if len(remaining_idx) == 0:
+    if n == 0:
         return cluster_ids, actions
 
-    plrs_high = plrs >= PLRS_HIGH_THRESHOLD
-    ciis_high = ciis >= CIIS_HIGH_THRESHOLD
-    trs_high  = trs  >= TRS_HIGH_THRESHOLD
+    # ── Stage 2: K-Means over all prompt words ─────────────────────────
+    X = np.stack([plrs, ciis, trs], axis=1).astype(np.float64)  # (n, 3)
+    k = min(8, n)
 
-    # 3-bit state for inspection/debugging:
-    # bit2=PLRS, bit1=CIIS, bit0=TRS
-    cluster_ids = (
-        (plrs_high.astype(np.int32) << 2)
-        | (ciis_high.astype(np.int32) << 1)
-        | trs_high.astype(np.int32)
-    )
+    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+    cluster_ids = km.fit_predict(X).astype(int)
+    centroids = km.cluster_centers_  # (k, 3)
 
-    for i in remaining_idx:
-        p_high = bool(plrs_high[i])
-        c_high = bool(ciis_high[i])
-        t_high = bool(trs_high[i])
+    # Prompt-level means used for relative High/Low decisions.
+    mean_plrs = float(np.mean(plrs))
+    mean_ciis = float(np.mean(ciis))
+    mean_trs  = float(np.mean(trs))
+
+    cluster_action: Dict[int, str] = {}
+    for c in range(k):
+        mu_plrs, mu_ciis, mu_trs = centroids[c]
+        p_high = mu_plrs > mean_plrs
+        c_high = mu_ciis > mean_ciis
+        t_high = mu_trs > mean_trs
 
         # ALSA Table 1 exact mapping.
         if p_high and c_high and t_high:
-            actions[i] = "Encrypt"
+            cluster_action[c] = "Encrypt"
         elif p_high and c_high and not t_high:
-            actions[i] = "Encrypt"
+            cluster_action[c] = "Encrypt"
         elif p_high and not c_high and t_high:
-            actions[i] = "Replace"
+            cluster_action[c] = "Replace"
         elif p_high and not c_high and not t_high:
-            actions[i] = "Delete"
+            cluster_action[c] = "Delete"
         elif not p_high and c_high and t_high:
-            actions[i] = "Retain"
+            cluster_action[c] = "Retain"
         elif not p_high and c_high and not t_high:
-            actions[i] = "Retain"
+            cluster_action[c] = "Retain"
         elif not p_high and not c_high and t_high:
-            actions[i] = "Retain"
+            cluster_action[c] = "Retain"
         else:  # (L, L, L)
-            actions[i] = "Delete"
+            cluster_action[c] = "Delete"
+
+    for i, cid in enumerate(cluster_ids):
+        actions[i] = cluster_action.get(int(cid), "Retain")
+
+    # ── Stage 1 override (applied last to guarantee Encrypt) ───────────
+    pii_mask = pii_override >= 0.9  # regex-confirmed PII
+    actions[pii_mask] = "Encrypt"
 
     return cluster_ids, actions
 
@@ -1305,88 +1132,88 @@ def _safe_mask_fallback(masked_prompt: str) -> str:
     return re.sub(re.escape(MASK_TOKEN), repl, masked_prompt)
 
 
+def _parse_single_candidate(response: str, masked_prompt: str) -> str:
+    """
+    Extract a single completed sentence from a one-shot LLM response.
+    Strip preamble lines (e.g. "Sure! Here is…"), quotes, and leading
+    whitespace, returning the first non-empty content line.
+    """
+    for line in response.strip().split("\n"):
+        line = line.strip().strip('"').strip("'")
+        # Skip empty lines and meta-commentary lines
+        if not line:
+            continue
+        if re.match(r'^(sure|here|certainly|of course|okay|ok)[,!:\s]', line, re.I):
+            continue
+        if MASK_TOKEN in line:
+            continue
+        return line
+    # If nothing usable, return the whole response cleaned up
+    return response.strip().strip('"').strip("'")
+
+
 async def _generate_encrypt_candidates(
     masked_prompt: str,
     original_prompt: str,
     n_candidates: int = ENCRYPT_NUM_CANDIDATES,
 ) -> List[str]:
     """
-    Generate m candidate prompts by asking Llama-3 to fill [MASK]
-    tokens in the masked prompt.
+    Generate m candidate prompts by running the masked prompt through Llama-3
+    m times separately (each with temperature=0.7, top_p=0.9) to obtain
+    diverse completions.  Per ALSA Appendix A, the LLM is run on P_M multiple
+    times; the self-recommendation step then selects the best.
 
-    Each candidate is a complete prompt with [MASK] replaced by
-    FICTIONAL, NON-IDENTIFYING substitutes that preserve sentence
-    structure but do NOT leak real PII.  Per ALSA Appendix A:
-    "words requiring encryption are entirely replaced with distinct
-    alternative expressions that preserve semantic integrity."
+    Each call asks for ONE completed sentence with [MASK] replaced by
+    contextually plausible, non-identifying alternatives.
     """
-    query = (
-        "You are a privacy-preserving rewrite engine.\n"
-        "Your ONLY goal is to replace [MASK] tokens with synthetic, non-identifying "
-        "content while preserving task meaning.\n\n"
-        "STRICT SAFETY CONSTRAINTS (MUST FOLLOW):\n"
-        "1) Never output real personal names, emails, phone numbers, SSNs, account IDs, "
-        "addresses, IPs, or dates.\n"
-        "2) Every replacement must be synthetic placeholders such as: PERSON_A, PERSON_B, "
-        "ORG_A, LOCATION_A, DATE_TOKEN, ID_TOKEN, EMAIL_TOKEN, PHONE_TOKEN, CONDITION_TOKEN, "
-        "MEDICATION_TOKEN, AMOUNT_TOKEN.\n"
-        "3) Keep sentence intent, tense, and grammatical structure.\n"
-        "4) Do not add new facts beyond what is implied by the masked prompt.\n"
-        "5) Output complete prompts with NO [MASK] remaining.\n"
-        "6) Output must be JSON only: an array of exactly "
-        f"{n_candidates} strings and nothing else.\n\n"
-        f"Original prompt (for meaning only): \"{original_prompt}\"\n"
-        f"Masked prompt (rewrite this): \"{masked_prompt}\"\n"
-    )
-    try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None, _llama_generate, query, ENCRYPT_CANDIDATE_TOKENS
+    # Single-call prompt: ask for one completed sentence only.
+    def _build_query() -> str:
+        return (
+            "Complete the following sentence by replacing every [MASK] token "
+            "with a plausible, contextually appropriate word or short phrase. "
+            "Do NOT use real personal names, account numbers, medical record IDs, "
+            "or any other identifying information. "
+            "Output the completed sentence ONLY — no explanations, no lists.\n\n"
+            f"Sentence: {masked_prompt}"
         )
-        raw_candidates: List[str] = []
 
-        # Preferred path: strict JSON array.
-        json_match = re.search(r'\[[\s\S]*\]', response)
-        if json_match:
-            try:
-                parsed = json.loads(json_match.group(0))
-                if isinstance(parsed, list):
-                    raw_candidates.extend(str(x).strip() for x in parsed)
-            except json.JSONDecodeError:
-                log.warning("Candidate JSON parse failed; falling back to line parser")
+    loop = asyncio.get_running_loop()
+    candidates: List[str] = []
+    seen: set = set()
+    max_attempts = n_candidates * 3  # allow retries for failures / duplicates
 
-        # Fallback parser for numbered lines.
-        if not raw_candidates:
-            for line in response.strip().split("\n"):
-                line = line.strip()
-                match = re.match(r'^\d+\.\s*(.+)$', line)
-                if match:
-                    raw_candidates.append(match.group(1).strip())
-
-        candidates: List[str] = []
-        seen: set = set()
-        for cand in raw_candidates:
-            candidate = cand.strip().strip('"').strip("'")
-            if not candidate or MASK_TOKEN in candidate:
-                continue
-            if candidate == original_prompt:
-                continue
-            if _contains_sensitive_patterns(candidate):
-                continue
-            if candidate not in seen:
+    for _ in range(max_attempts):
+        if len(candidates) >= n_candidates:
+            break
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: _llama_generate(
+                    _build_query(),
+                    max_tokens=ENCRYPT_CANDIDATE_TOKENS,
+                    temp=0.7,   # paper §4 experiment setup
+                    top_p=0.9,  # paper §4 experiment setup
+                    top_k=50,   # paper §4 experiment setup
+                ),
+            )
+            candidate = _parse_single_candidate(response, masked_prompt)
+            if (
+                candidate
+                and MASK_TOKEN not in candidate
+                and candidate != original_prompt
+                and not _contains_sensitive_patterns(candidate)
+                and candidate not in seen
+            ):
                 seen.add(candidate)
                 candidates.append(candidate)
-            if len(candidates) >= n_candidates:
-                break
+        except Exception as exc:
+            log.warning("Encrypt candidate generation attempt failed: %s", exc)
 
-        if not candidates:
-            log.warning("No safe candidates parsed from LLM response, using deterministic fallback")
-            return [_safe_mask_fallback(masked_prompt)]
-
-        return candidates
-    except Exception as exc:
-        log.warning("Encrypt candidate generation failed: %s", exc)
+    if not candidates:
+        log.warning("All candidate generation attempts failed; using deterministic fallback")
         return [_safe_mask_fallback(masked_prompt)]
+
+    return candidates
 
 
 async def _score_candidates(
@@ -1409,20 +1236,26 @@ async def _score_candidates(
     if len(candidates) == 1:
         return 0
 
+    # Build candidate list exactly as shown in ALSA paper Figure 5.
     candidate_list = "\n".join(
-        f'{i+1}. "{c}"' for i, c in enumerate(candidates)
+        f"{i+1}. {c}" for i, c in enumerate(candidates)
     )
+    # ALSA Figure 5 — Self-Recommendation Prompt (verbatim structure):
+    #   Role    : expert evaluator
+    #   Task    : Here is the task …
+    #   Reference: Here is the reference prompt …
+    #   Candidates: numbered list
+    #   Instruction: evaluate fluency / coherence / semantic consistency
     query = (
         f"You are an expert in language understanding and evaluation.\n\n"
-        f"Reference prompt: \"{original_prompt}\"\n\n"
-        f"Candidate prompts:\n{candidate_list}\n\n"
-        f"Instruction: Select the prompt that is most fluent, coherent, "
-        f"and best achieves the same task result as the reference prompt. "
-        f"Consider:\n"
-        f"- Fluency (weight: {ENCRYPT_ALPHA}): grammatical correctness and naturalness\n"
-        f"- Coherence (weight: {ENCRYPT_BETA}): logical consistency with the reference\n"
-        f"- Task Consistency (weight: {ENCRYPT_GAMMA}): achieves the same goal\n\n"
-        f"Provide ONLY the number."
+        f"Here is the task: {original_prompt}\n\n"
+        f"Here is the reference prompt: {original_prompt}\n\n"
+        f"{candidate_list}\n\n"
+        f"Please evaluate each prompt above based on fluency, coherence, and "
+        f"semantic consistency with the reference prompt. "
+        f"Select the prompt that is the most fluent, coherent, and best achieves "
+        f"the same task result as the reference prompt. "
+        f"Provide only the number of the selected prompt."
     )
     try:
         loop = asyncio.get_running_loop()
@@ -1510,7 +1343,6 @@ async def run_pipeline(prompt: str) -> Dict:
     common_vecs = registry.bert_common_vectors.numpy()
     plrs, pii_override = compute_plrs(
         bert_vecs_isolated, common_vecs, prompt, words,
-        registry.spacy_nlp,
         registry.gpt2_tokenizer, registry.gpt2_model, registry.device,
     )
     log.info("PLRS: %s", np.round(plrs, 3))
@@ -1628,10 +1460,10 @@ async def analyse_prompt(body: PromptRequest):
 
 TEST_CASES = [
     # 1. Standard everyday sentence
-    # "The quick brown fox jumps over the lazy dog near the river.",
+    "A quick brown fox jumps over the lazy dog near the river.",
 
     # 2. Heavy PII — personal information + SSN
-    "My name is John Smith and my social security number is 432-91-8765.",
+    # "My name is John Smith and my social security number is 432-91-8765.",
 
     # "You can reach Dr. Emily Carter at random34241@gmail.com or call her private cell at 555-019-8372",
 
